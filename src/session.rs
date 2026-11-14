@@ -3,7 +3,7 @@
 //! One streaming pass (320 ms chunks) over all the audio gives the live text; the "open" region (after the last
 //! frozen sentence) is re-decoded with full context at every short pause and every few seconds of new audio, with
 //! left context before it. Speech / silence: Silero VAD. A sentence ends when the model's end-of-turn head says the
-//! speaker has finished (read once per pause, at 0.24 s of silence, from a second pass over the turn), after 3 s of
+//! speaker has finished (read at 0.24 s of silence, from a second pass over the turn; a "no" again at 0.48 s), after 3 s of
 //! silence anyway, or when the re-decode writes . ? ! and the next sentence has already started; `finish` freezes
 //! everything. Language: one fixed, or with several allowed each re-decode runs in each of them and keeps the one the
 //! model is surest of (the stream follows).
@@ -397,10 +397,10 @@ impl<'m> Session<'m> {
             self.v_on = p > 0.5 || (self.v_on && p > 0.35);
         }
         let voiced = self.v_on;
-        // end of utterance: the end-of-turn head once per pause, at 0.24 s of silence (it was trained on 0-0.5 s of
-        // silence after the speech), from a second pass over the turn so far (<= 30 s); ended at P > 0.5, frozen at
-        // 0.48 s of silence so the re-decode hears the word's end (speech before that cancels it); or after 3 s of
-        // silence anyway (without the head: 1.6 s)
+        // end of utterance: the end-of-turn head at 0.24 s of silence (it was trained on 0-0.5 s of silence after the
+        // speech), from a second pass over the turn so far (<= 30 s); ended at P > 0.5, frozen at 0.48 s of silence so
+        // the re-decode hears the word's end (speech before that cancels it); a "no" is asked again at 0.48 s; or
+        // after 3 s of silence anyway (without the head: 1.6 s)
         if voiced {
             self.spoke = true;
             self.eou = false;
@@ -416,9 +416,20 @@ impl<'m> Session<'m> {
                         self.eou = true;
                     }
                 }
-            } else if self.eou && q == 12 {
+            } else if head && q == 12 {
+                // a "not done" at 0.24 s is asked again on the longer silence (still inside the head's 0-0.5 s)
+                let mut end = self.eou;
+                if !end {
+                    let from = self.aud0.max(self.turn0).max(self.pos - 30 * SR);
+                    if let Some(p) = self.m.eou(self.audio(from, self.pos), self.lang) {
+                        self.ev.push(Event::Eou { at: self.pos as f32 / SR as f32, p });
+                        end = p > 0.5;
+                    }
+                }
                 self.eou = false;
-                self.end_sentence();
+                if end {
+                    self.end_sentence();
+                }
             } else if q == if head { 75 } else { 40 } {
                 self.end_sentence();
             }

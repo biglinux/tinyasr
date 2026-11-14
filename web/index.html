@@ -172,15 +172,30 @@ const $ = id => document.getElementById(id);
 const status = s => $("status").innerHTML = s;
 const esc = s => String(s).replace(/[&<>]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" }[c]));
 
-// models next to the page (repository root: models/); downloaded on first use
+// models next to the page (repository root: models/); downloaded on first use. They're stored gzip-compressed
+// (name.gz, unpacked here); a plain file of the name is used when there's no .gz. mb: the download (gzip) size
 const BASE = "../models/";
 const MODELS = [
-  { file: "en-ru-uk.tzf", name: "English, Russian, Ukrainian", langs: ["en", "ru", "uk"], mb: 35.9 },
-  { file: "en-es-it-pt.tzf", name: "English, Spanish, Italian, Portuguese", langs: ["en", "es", "it", "pt"], mb: 36.9 },
-  { file: "en-ru-uz.tzf", name: "English, Russian, Uzbek", langs: ["en", "ru", "uz"], mb: 35.7 },
-  { file: "en-fa.tzf", name: "English, Persian", langs: ["en", "fa"], mb: 34.6 },
-  { file: "en-km.tzf", name: "English, Khmer", langs: ["en", "km"], mb: 34.6 },
+  { file: "en-ru-uk.tzf", name: "English, Russian, Ukrainian", langs: ["en", "ru", "uk"], mb: 31.2 },
+  { file: "en-es-it-pt.tzf", name: "English, Spanish, Italian, Portuguese", langs: ["en", "es", "it", "pt"], mb: 32.2 },
+  { file: "en-ru-uz.tzf", name: "English, Russian, Uzbek", langs: ["en", "ru", "uz"], mb: 31.1 },
+  { file: "en-fa.tzf", name: "English, Persian", langs: ["en", "fa"], mb: 30.1 },
+  { file: "en-km.tzf", name: "English, Khmer", langs: ["en", "km"], mb: 30.1 },
 ];
+// fetches name.gz, or name itself when there's no .gz
+async function fetchModelFile(name) {
+  const r = await fetch(name + ".gz");
+  if (r.ok) return r;
+  const plain = await fetch(name);
+  if (!plain.ok) throw new Error(`${name}: ${plain.status} ${plain.statusText}`);
+  return plain;
+}
+// gzip data unpacked; anything else as it is (a plain file, or one the server already unpacked: Content-Encoding)
+async function gunzip(buf) {
+  const b = new Uint8Array(buf, 0, Math.min(2, buf.byteLength));
+  if (b[0] !== 0x1f || b[1] !== 0x8b) return buf;
+  return new Response(new Blob([buf]).stream().pipeThrough(new DecompressionStream("gzip"))).arrayBuffer();
+}
 const NAMES = { en: "English", ru: "Русский", uk: "Українська", es: "Español", it: "Italiano", pt: "Português", uz: "Özbekça", fa: "فارسی", km: "ខ្មែរ" };
 // Auto-detect: the model each language is recognized with (en, ru: the en-ru-uk model)
 const MODEL_OF = { en: 0, ru: 0, uk: 0, es: 1, it: 1, pt: 1, uz: 2, fa: 3, km: 4 };
@@ -220,9 +235,10 @@ async function boot() {
   $("model").value = "auto";
   fillLangs();
   lidBoot().catch(err => console.warn("tinylid:", err));
-  const [wasm, vad] = await Promise.all(["tinyasr.wasm", BASE + "silero_vad.onnx"].map(async u => {
-    const r = await fetch(u); if (!r.ok) throw new Error(`${u}: ${r.status}`); return r.arrayBuffer();
-  }));
+  const [wasm, vad] = await Promise.all([
+    fetch("tinyasr.wasm").then(r => { if (!r.ok) throw new Error(`tinyasr.wasm: ${r.status}`); return r.arrayBuffer(); }),
+    fetchModelFile(BASE + "silero_vad.onnx").then(r => r.arrayBuffer()).then(gunzip),
+  ]);
   worker = new Worker(URL.createObjectURL(new Blob([$("worker-src").textContent], { type: "text/javascript" })));
   worker.onmessage = onWorker;
   worker.postMessage({ type: "init", wasm, vad }, [wasm, vad]);
@@ -238,13 +254,12 @@ function getModel(i) {
     const dl = $("dl"); dl.hidden = false;
     const show = (a, b) => dl.innerHTML = `Downloading the ${esc(M.name)} model… <progress value="${a}" max="${b || 1}"></progress> ${(a / 1e6).toFixed(1)} / ${(b / 1e6).toFixed(1)} MB`;
     try {
-      const r = await fetch(BASE + M.file);
-      if (!r.ok) throw new Error(r.status + " " + r.statusText);
+      const r = await fetchModelFile(BASE + M.file);
       const total = +r.headers.get("content-length") || M.mb * 1e6, rd = r.body.getReader(), parts = [];
       let got = 0; show(0, total);
       for (;;) { const { done, value } = await rd.read(); if (done) break; parts.push(value); got += value.length; show(got, total); }
       dl.innerHTML = `Loading the ${esc(M.name)} model…`;
-      const buf = await new Blob(parts).arrayBuffer();
+      const buf = await gunzip(await new Blob(parts).arrayBuffer());
       worker.postMessage({ type: "model", file: M.file, buf }, [buf]);
     } catch (err) { dl.innerHTML = `Could not download ${esc(BASE + M.file)}: ${esc(err.message)}`; }
   })();
@@ -287,7 +302,7 @@ function onWorker(ev) {
   const m = ev.data;
   if (m.type === "ready") {
     ready = true; ["mic", "model", "lang", "clear", "file"].forEach(id => $(id).disabled = false);
-    status("Ready. The speech model downloads when you first use it (about 36 MB).");
+    status("Ready. The speech model downloads when you first use it (about 31 MB).");
   } else if (m.type === "loaded") {
     loaded[m.file] = true; $("dl").hidden = true; loading[m.file].done();
   } else if (m.type === "error") {
@@ -315,9 +330,10 @@ function langs() { if (auto()) return lastLang(); const M = MODELS[+$("model").v
 let lid = null, lidLangs = null, lidSeq = 0;
 const lidWait = {};
 async function lidBoot() {
-  const [wasm, model] = await Promise.all(["tinylid.wasm", BASE + "tinylid.bin"].map(async u => {
-    const r = await fetch(u); if (!r.ok) throw new Error(`${u}: ${r.status}`); return r.arrayBuffer();
-  }));
+  const [wasm, model] = await Promise.all([
+    fetch("tinylid.wasm").then(r => { if (!r.ok) throw new Error(`tinylid.wasm: ${r.status}`); return r.arrayBuffer(); }),
+    fetchModelFile(BASE + "tinylid.bin").then(r => r.arrayBuffer()).then(gunzip),
+  ]);
   lid = new Worker(URL.createObjectURL(new Blob([$("lid-src").textContent], { type: "text/javascript" })));
   lid.onmessage = ev => {
     const m = ev.data;
