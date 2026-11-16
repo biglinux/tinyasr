@@ -229,8 +229,9 @@ impl Quant {
 
     /// out (m x n) = a (m x k) * W^T (+ bias).
     ///
-    /// With the dot-product extension (aarch64 `sdot`), the activations are quantized to int8 per row and per
-    /// weight group and multiplied by the integer weights directly (`INT8_DOT=0` turns this off). Otherwise the
+    /// With the dot-product extension (aarch64 `sdot`) or wasm SIMD128 (`i32x4.dot_i16x8_s`), the activations are
+    /// quantized to int8 per row and per weight group and multiplied by the integer weights directly (`INT8_DOT=0`
+    /// turns this off on aarch64). Otherwise the
     /// weights are widened to f32 one panel of NR rows at a time and reused for a block of MB rows of `a` by the
     /// float micro-kernel.
     fn gemm(&self, a: &[f32], m: usize, bias: Option<&[f32]>) -> Vec<f32> {
@@ -289,8 +290,10 @@ impl Quant {
 const TR: usize = 2;
 const TC: usize = 4;
 
-/// Whether `Quant` multiplies with int8 dot products (aarch64 with `sdot`, not disabled by INT8_DOT=0).
+/// Whether `Quant` multiplies with int8 dot products (aarch64 with `sdot`, not disabled by INT8_DOT=0; wasm SIMD128).
 fn int8_dot() -> bool {
+    #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+    return true;
     #[cfg(all(target_arch = "aarch64", feature = "std"))]
     {
         static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -320,7 +323,7 @@ fn int8_dot() -> bool {
     {
         cfg!(target_feature = "dotprod")
     }
-    #[cfg(not(target_arch = "aarch64"))]
+    #[cfg(not(any(target_arch = "aarch64", all(target_arch = "wasm32", target_feature = "simd128"))))]
     {
         // the same integer arithmetic, portable (to check accuracy off-device): TINYASR_INT8=1
         #[cfg(feature = "std")]
@@ -365,7 +368,13 @@ fn tile_i8<const R: usize, const C: usize>(aq: &[i8], sa: &[f32], wq: &[i8], sw:
     unsafe {
         tile_sdot::<R, C>(aq.as_ptr(), sa.as_ptr(), wq.as_ptr(), sw.as_ptr(), k, g, &mut res)
     };
-    #[cfg(not(target_arch = "aarch64"))]
+    #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+    #[allow(unsafe_code)]
+    // SAFETY: all reads are inside the slices asserted above.
+    unsafe {
+        tile_wasm::<R, C>(aq.as_ptr(), sa.as_ptr(), wq.as_ptr(), sw.as_ptr(), k, g, &mut res)
+    };
+    #[cfg(not(any(target_arch = "aarch64", all(target_arch = "wasm32", target_feature = "simd128"))))]
     for (r, res) in res.iter_mut().enumerate() {
         for (c, res) in res.iter_mut().enumerate() {
             let (a, w) = (&aq[r * k..(r + 1) * k], &wq[c * k..(c + 1) * k]);
@@ -412,6 +421,48 @@ unsafe fn tile_sdot<const R: usize, const C: usize>(aq: *const i8, sa: *const f3
         for r in 0..R {
             for j in 0..C {
                 res[r][j] = vaddvq_f32(accf[r][j]);
+            }
+        }
+    }
+}
+
+/// wasm SIMD128 version of `tile_sdot`: int8 widened to int16, `i32x4.dot_i16x8_s` (16 products per 2 dots).
+#[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+#[allow(unsafe_code)]
+unsafe fn tile_wasm<const R: usize, const C: usize>(aq: *const i8, sa: *const f32, wq: *const i8, sw: *const f32, k: usize, g: usize, res: &mut [[f32; C]; R]) {
+    use core::arch::wasm32::*;
+    let ng = k / g;
+    // SAFETY: the caller guarantees R rows of k activations / C rows of k weights and their ng scales each.
+    unsafe {
+        let mut accf = [[f32x4_splat(0.0); C]; R];
+        for c in 0..ng {
+            let mut acci = [[i32x4_splat(0); C]; R];
+            let mut p = c * g;
+            while p < (c + 1) * g {
+                let a: [(v128, v128); R] = core::array::from_fn(|r| {
+                    let v = v128_load(aq.add(r * k + p) as *const v128);
+                    (i16x8_extend_low_i8x16(v), i16x8_extend_high_i8x16(v))
+                });
+                for j in 0..C {
+                    let v = v128_load(wq.add(j * k + p) as *const v128);
+                    let (lo, hi) = (i16x8_extend_low_i8x16(v), i16x8_extend_high_i8x16(v));
+                    for r in 0..R {
+                        acci[r][j] = i32x4_add(acci[r][j], i32x4_add(i32x4_dot_i16x8(a[r].0, lo), i32x4_dot_i16x8(a[r].1, hi)));
+                    }
+                }
+                p += 16;
+            }
+            for r in 0..R {
+                for j in 0..C {
+                    let s = f32x4_splat(*sa.add(r * ng + c) * *sw.add(j * ng + c));
+                    accf[r][j] = f32x4_add(accf[r][j], f32x4_mul(f32x4_convert_i32x4(acci[r][j]), s));
+                }
+            }
+        }
+        for r in 0..R {
+            for j in 0..C {
+                let v = accf[r][j];
+                res[r][j] = f32x4_extract_lane::<0>(v) + f32x4_extract_lane::<1>(v) + f32x4_extract_lane::<2>(v) + f32x4_extract_lane::<3>(v);
             }
         }
     }

@@ -64,7 +64,7 @@ progress { width: 160px; height: 8px; vertical-align: middle; }
 // session logic (streaming pass, re-decodes, Silero VAD, end of turn) is in the library; this only moves bytes and JSON.
 let x = null;
 const models = {};  // file -> tinyasr_models pointer
-const BEAM = 0;  // beam width of the full-context pass (0: the library's default, 4; 1: greedy)
+const BEAM = 1;  // beam width of the full-context pass (0: the library's default, 4; 1: greedy): greedy, beam 4 is ~20% slower in wasm
 let S = 0, M = 0;
 const mem = () => new Uint8Array(x.memory.buffer);
 function put(b) { const p = x.tinyasr_alloc(b.length); mem().set(b, p); return [p, b.length]; }
