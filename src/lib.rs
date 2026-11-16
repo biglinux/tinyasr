@@ -57,6 +57,14 @@ pub use vad::{Vad, VadState};
 /// Sample rate of all audio in and out (mono f32 in [-1, 1]).
 pub const SAMPLE_RATE: u32 = 16_000;
 
+/// Beam width of the full-context pass unless the host sets one ([`Options::beam`], [`Transcription::new`]); 1 is greedy.
+pub const DEFAULT_BEAM: usize = 4;
+
+/// Version of the library (its API and the model files it reads); C: `tinyasr_version()`.
+pub fn version() -> u32 {
+    1
+}
+
 /// Recognition languages (the order of the model's language embeddings).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Lang {
@@ -140,7 +148,7 @@ impl Models {
         })
     }
 
-    /// The languages of the recognizer: en, ru, uk; en, es, it, pt; en, ru, uz; or en, fa.
+    /// The languages of the recognizer: en, ru, uk; en, es, it, pt; en, ru, uz; en, fa; or en, km.
     pub fn langs(&self) -> &[Lang] {
         &self.asr.langs
     }
@@ -152,13 +160,13 @@ impl Models {
 
     /// The full-context pass in the one of `langs` the model is most sure of (mean token log-probability): (tokens,
     /// that language; None if it wrote nothing).
-    fn full(&self, x: &[f32], langs: &[Lang]) -> (Vec<crate::model::Token>, Option<Lang>) {
+    fn full(&self, x: &[f32], langs: &[Lang], beam: usize) -> (Vec<crate::model::Token>, Option<Lang>) {
         if let [l] = langs {
-            return (self.asr.full(x, self.asr.lang_index(*l)), Some(*l));
+            return (self.asr.full(x, self.asr.lang_index(*l), beam), Some(*l));
         }
         let mut best: Option<(f32, Vec<crate::model::Token>, Lang)> = None;
         for &l in langs {
-            let t = self.asr.full(x, self.asr.lang_index(l));
+            let t = self.asr.full(x, self.asr.lang_index(l), beam);
             let sc = if t.is_empty() { -1e9 } else { t.iter().map(|k| k.logp).sum::<f32>() / t.len() as f32 };
             if best.as_ref().is_none_or(|b| sc > b.0) {
                 best = Some((sc, t, l));
@@ -184,10 +192,13 @@ pub struct Options {
     /// slow device; without a clock their time is estimated as `decode_rtf` x the audio.
     pub clock: Option<Box<dyn Fn() -> f64>>,
     pub decode_rtf: f32,
+    /// Beam width of the full-context pass (re-decodes of the open sentence); 1: greedy (fastest). Streaming text is
+    /// always greedy.
+    pub beam: usize,
 }
 
 impl Default for Options {
     fn default() -> Options {
-        Options { start_lang: Lang::En, clock: None, decode_rtf: 0.1 }
+        Options { start_lang: Lang::En, clock: None, decode_rtf: 0.1, beam: DEFAULT_BEAM }
     }
 }

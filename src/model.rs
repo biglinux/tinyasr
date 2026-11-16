@@ -172,12 +172,21 @@ impl Tensors {
         self.get(k).1[0]
     }
 
+    fn has(&self, k: &str) -> bool {
+        self.t.contains_key(k)
+    }
+
     /// Integer weights stay integer (`Quant`) when the groups tile the row exactly; otherwise f32.
     fn linear(&mut self, k: &str, bias: bool) -> Linear {
-        let name = alloc::format!("{k}.weight");
-        let (d, data) = self.t.remove(&name).unwrap_or_else(|| panic!("missing tensor {name}"));
+        let b = if bias { Some(alloc::format!("{k}.bias")) } else { None };
+        self.linear_named(&alloc::format!("{k}.weight"), b.as_deref())
+    }
+
+    /// As `linear`, for tensors not named X.weight / X.bias (the LSTM's weight_ih_l0 ...).
+    fn linear_named(&mut self, name: &str, bias: Option<&str>) -> Linear {
+        let (d, data) = self.t.remove(name).unwrap_or_else(|| panic!("missing tensor {name}"));
         let (n, kk): (usize, usize) = (d[0], d[1..].iter().product());
-        let b = if bias { Some(self.vec(&alloc::format!("{k}.bias"))) } else { None };
+        let b = bias.map(|k| self.vec(k));
         let w = match data {
             Data::Int { group, row, scale, q } if row == kk => Weight::Int(Quant::new(n, kk, group, scale, q)),
             data => Weight::F32(Packed::from_rows(&data.f32(&d), n, kk)),
@@ -771,6 +780,43 @@ impl Head {
     }
 }
 
+/// v5.9t hybrid decoder: an LSTM over the whole token history, added to the stateless output through a scalar gate
+/// (decoder.py: embedding_out + gate * lstm_proj(lstm(embedding(y)))). One step per emitted token.
+struct Lstm {
+    ih: Linear, // 4H x D, bias = b_ih + b_hh
+    hh: Linear, // 4H x H
+    proj: Linear, // D x H
+    gate: f32,
+    hidden: usize,
+}
+
+impl Lstm {
+    /// One step of torch.nn.LSTM (gate order i, f, g, o) on input x; updates h, c.
+    fn step(&self, x: &[f32], h: &mut [f32], c: &mut [f32]) {
+        let n = self.hidden;
+        let mut g = self.ih.apply(x, 1);
+        let r = self.hh.apply(h, 1);
+        g.iter_mut().zip(&r).for_each(|(a, b)| *a += b);
+        for j in 0..n {
+            let (i, f, gg, o) = (sigmoid(g[j]), sigmoid(g[n + j]), tanh(g[2 * n + j]), sigmoid(g[3 * n + j]));
+            c[j] = f * c[j] + i * gg;
+            h[j] = o * tanh(c[j]);
+        }
+    }
+}
+
+/// Most zero-duration tokens on one frame in TDT greedy before it is forced on (the server scorer's max_sym).
+const TDT_MAX_SYM: usize = 5;
+
+/// One beam-search hypothesis: decoder state, total log-probability, tokens.
+#[derive(Clone)]
+pub struct Hyp {
+    dec: Decoding,
+    logp: f32,
+    toks: Vec<Token>,
+    pending: bool, // TDT beam: the last token is not yet in `dec` (advanced only if the hypothesis survives pruning)
+}
+
 pub struct Model {
     head: Option<Head>,
     embed: Embed,
@@ -782,6 +828,8 @@ pub struct Model {
     dec_dim: usize,
     context: usize,
     joiner: Joiner,
+    lstm: Option<Lstm>,
+    dur: Option<Linear>, // TDT duration head (durations 0..n-1) on the joiner hidden; None = RNN-T
     pos_dim: usize,
     pub left: usize,
     pub chunk: usize,
@@ -926,6 +974,18 @@ impl Model {
             })
             .collect();
         let joiner = Joiner { enc: w.linear("joiner.encoder_proj", true), dec: w.linear("joiner.decoder_proj", true), out };
+        let dur = if w.has("joiner.duration_linear.weight") { Some(w.linear("joiner.duration_linear", true)) } else { None };
+        let lstm = if w.has("decoder.lstm.weight_ih_l0") {
+            let mut ih = w.linear_named("decoder.lstm.weight_ih_l0", None);
+            let (b1, b2) = (w.vec("decoder.lstm.bias_ih_l0"), w.vec("decoder.lstm.bias_hh_l0"));
+            ih.b = Some(b1.iter().zip(&b2).map(|(a, b)| a + b).collect());
+            let hh = w.linear_named("decoder.lstm.weight_hh_l0", None);
+            let proj = w.linear_named("decoder.lstm_proj.weight", None);
+            let hidden = b2.len() / 4;
+            Some(Lstm { ih, hh, proj, gate: w.scalar("decoder.lstm_gate_m.g"), hidden })
+        } else {
+            None
+        };
         let (dd, dec_emb) = w.get("decoder.embedding.weight");
         let head = Head::load(&mut w);
         Ok(Model {
@@ -939,6 +999,8 @@ impl Model {
             dec_dim: dd[1],
             context: w.c("context"),
             joiner,
+            lstm,
+            dur,
             pos_dim,
             left: w.c("left_context"),
             chunk: w.c("chunk"),
@@ -1004,9 +1066,79 @@ impl Model {
         self.encode(e, tc, None, &[])
     }
 
-    fn decoder_out(&self, ctx: &[u32]) -> Vec<f32> {
-        self.joiner.dec.apply(&self.decoder_y(ctx), 1)
+    fn decoder_out(&self, ctx: &[u32], h: &[f32]) -> Vec<f32> {
+        let mut y = self.decoder_y(ctx);
+        if let Some(l) = &self.lstm {
+            let p = l.proj.apply(h, 1);
+            y.iter_mut().zip(&p).for_each(|(a, b)| *a += l.gate * b);
+        }
+        self.joiner.dec.apply(&y, 1)
     }
+
+    /// `advance` for several hypotheses at once: the LSTM, its projection and the joiner's decoder projection run as
+    /// one batch.
+    fn advance_batch(&self, decs: &mut [&mut Decoding], ids: &[u32]) {
+        let n = decs.len();
+        if n == 0 {
+            return;
+        }
+        let d = self.dec_dim;
+        let mut ys: Vec<f32> = Vec::with_capacity(n * d);
+        for (dec, &id) in decs.iter_mut().zip(ids) {
+            dec.ctx.push(id);
+            ys.extend(self.decoder_y(&dec.ctx));
+        }
+        if let Some(l) = &self.lstm {
+            let hn = l.hidden;
+            let mut x = Vec::with_capacity(n * d);
+            let mut hp = Vec::with_capacity(n * hn);
+            for (dec, &id) in decs.iter().zip(ids) {
+                x.extend_from_slice(&self.dec_emb[id as usize * d..(id as usize + 1) * d]);
+                hp.extend_from_slice(&dec.h);
+            }
+            let mut g = l.ih.apply(&x, n);
+            let r = l.hh.apply(&hp, n);
+            g.iter_mut().zip(&r).for_each(|(a, b)| *a += b);
+            for (b, dec) in decs.iter_mut().enumerate() {
+                let g = &g[b * 4 * hn..(b + 1) * 4 * hn];
+                for j in 0..hn {
+                    let (i, f, gg, o) = (sigmoid(g[j]), sigmoid(g[hn + j]), tanh(g[2 * hn + j]), sigmoid(g[3 * hn + j]));
+                    dec.c[j] = f * dec.c[j] + i * gg;
+                    dec.h[j] = o * tanh(dec.c[j]);
+                }
+            }
+            let mut hs = Vec::with_capacity(n * hn);
+            decs.iter().for_each(|dec| hs.extend_from_slice(&dec.h));
+            let p = l.proj.apply(&hs, n);
+            ys.iter_mut().zip(&p).for_each(|(a, b)| *a += l.gate * b);
+        }
+        let o = self.joiner.dec.apply(&ys, n);
+        let jd = o.len() / n;
+        for (b, dec) in decs.iter_mut().enumerate() {
+            dec.out = o[b * jd..(b + 1) * jd].to_vec();
+        }
+    }
+
+    /// Joiner hidden of every hypothesis at encoder frame i (rows), from the projected encoder output `ep`.
+    fn joint_rows(&self, ep: &[f32], i: usize, decs: &[&Decoding]) -> Vec<f32> {
+        let jd = self.joiner.enc.n();
+        let mut h = Vec::with_capacity(decs.len() * jd);
+        for dec in decs {
+            h.extend((0..jd).map(|k| tanh(ep[i * jd + k] + dec.out[k])));
+        }
+        h
+    }
+
+    /// Emit `id`: extend the history, advance the LSTM, recompute the decoder output.
+    fn advance(&self, dec: &mut Decoding, id: u32) {
+        dec.ctx.push(id);
+        if let Some(l) = &self.lstm {
+            let d = self.dec_dim;
+            l.step(&self.dec_emb[id as usize * d..(id as usize + 1) * d], &mut dec.h, &mut dec.c);
+        }
+        dec.out = self.decoder_out(&dec.ctx, &dec.h);
+    }
+
 
     /// Decoder output before the joiner's projection (dec_dim), for the last `context` tokens of `ctx`.
     fn decoder_y(&self, ctx: &[u32]) -> Vec<f32> {
@@ -1028,6 +1160,9 @@ impl Model {
 
     /// Greedy RNN-T over encoder frames, continuing from `dec`.
     fn greedy(&self, enc: &[f32], t: usize, lang: usize, dec: &mut Decoding, frame0: u32) -> Vec<Token> {
+        if let Some(dur) = &self.dur {
+            return self.greedy_tdt(dur, enc, t, lang, dec, frame0);
+        }
         let ep = self.joiner.enc.apply(enc, t);
         let jd = self.joiner.enc.n();
         let (out, ids) = &self.joiner.out[lang];
@@ -1047,15 +1182,203 @@ impl Model {
                 }
                 let lse = m + logit.iter().map(|v| exp(v - m)).sum::<f32>().ln();
                 toks.push(Token { id, frame: frame0 + i as u32, logp: m - lse });
-                dec.ctx.push(id);
-                dec.out = self.decoder_out(&dec.ctx);
+                self.advance(dec, id);
             }
         }
         toks
     }
 
-    /// Second pass: full-context transcription of a finished segment (16 kHz).
-    pub fn full(&self, audio: &[f32], lang: usize) -> Vec<Token> {
+    /// modified_beam_search (icefall beam_search.py): per frame, every hypothesis is extended by its log-softmax over the
+    /// language's tokens; the `beam` best (hypothesis, token) pairs survive, blank keeping the text; at most one token
+    /// per frame; hypotheses with the same tokens are merged (log-add). Continues from `hyps`.
+    fn beam_rnnt(&self, enc: &[f32], t: usize, lang: usize, hyps: &mut Vec<Hyp>, frame0: u32, beam: usize) {
+        let ep = self.joiner.enc.apply(enc, t);
+        let (out, ids) = &self.joiner.out[lang];
+        for i in 0..t {
+            let mut cand: Vec<(f32, usize, usize, f32)> = Vec::new(); // (score, hyp, output index, token logp)
+            let nh = hyps.len();
+            let hrows = self.joint_rows(&ep, i, &hyps.iter().map(|h| &h.dec).collect::<Vec<_>>());
+            let lg = out.apply(&hrows, nh);
+            let vn = lg.len() / nh;
+            for (hi, hy) in hyps.iter().enumerate() {
+                let logit = &lg[hi * vn..(hi + 1) * vn];
+                let m = logit.iter().cloned().fold(f32::MIN, f32::max);
+                let lse = m + logit.iter().map(|v| exp(v - m)).sum::<f32>().ln();
+                for (k, &v) in logit.iter().enumerate() {
+                    cand.push((hy.logp + v - lse, hi, k, v - lse));
+                }
+            }
+            let n = beam.min(cand.len());
+            cand.select_nth_unstable_by(n - 1, |a, b| b.0.partial_cmp(&a.0).unwrap_or(core::cmp::Ordering::Equal));
+            cand.truncate(n);
+            let mut next: Vec<Hyp> = Vec::with_capacity(n);
+            for &(score, hi, k, lp) in &cand {
+                let id = ids[k];
+                let mut hy = hyps[hi].clone();
+                hy.logp = score;
+                if id != 0 {
+                    hy.toks.push(Token { id, frame: frame0 + i as u32, logp: lp });
+                    hy.pending = true;
+                }
+                if let Some(o) = next.iter_mut().find(|o| o.toks.len() == hy.toks.len() && o.toks.iter().zip(&hy.toks).all(|(a, b)| a.id == b.id)) {
+                    let (a, b) = (o.logp.max(hy.logp), o.logp.min(hy.logp));
+                    o.logp = a + (1.0 + exp(b - a)).ln();
+                } else {
+                    next.push(hy);
+                }
+            }
+            let pend: Vec<u32> = next.iter().filter(|h| h.pending).map(|h| h.toks.last().unwrap().id).collect();
+            let mut decs: Vec<&mut Decoding> = next.iter_mut().filter(|h| h.pending).map(|h| { h.pending = false; &mut h.dec }).collect();
+            self.advance_batch(&mut decs, &pend);
+            *hyps = next;
+        }
+    }
+
+    fn beam_tdt(&self, dur: &Linear, enc: &[f32], t: usize, lang: usize, beam: usize) -> Vec<Token> {
+        let ep = self.joiner.enc.apply(enc, t);
+        let (out, ids) = &self.joiner.out[lang];
+        let lsm = |v: &[f32]| {
+            let m = v.iter().cloned().fold(f32::MIN, f32::max);
+            let lse = m + v.iter().map(|x| exp(x - m)).sum::<f32>().ln();
+            v.iter().map(|x| x - lse).collect::<Vec<f32>>()
+        };
+        let same = |a: &Hyp, b: &Hyp| a.toks.len() == b.toks.len() && a.toks.iter().zip(&b.toks).all(|(x, y)| x.id == y.id);
+        // merge `hy` into `list` (log-add on equal text)
+        let push = |list: &mut Vec<Hyp>, hy: Hyp| {
+            if let Some(o) = list.iter_mut().find(|o| same(o, &hy)) {
+                let (a, b) = (o.logp.max(hy.logp), o.logp.min(hy.logp));
+                o.logp = a + (1.0 + exp(b - a)).ln();
+            } else {
+                list.push(hy);
+            }
+        };
+        let mut buckets: Vec<Vec<Hyp>> = (0..t).map(|_| Vec::new()).collect();
+        let mut done: Vec<Hyp> = Vec::new();
+        if t == 0 {
+            return Vec::new();
+        }
+        buckets[0] = self.start_beam();
+        for i in 0..t {
+            let mut cur = core::mem::take(&mut buckets[i]);
+            for _round in 0..=TDT_MAX_SYM {
+                if cur.is_empty() {
+                    break;
+                }
+                cur.sort_by(|a, b| b.logp.partial_cmp(&a.logp).unwrap_or(core::cmp::Ordering::Equal));
+                cur.truncate(beam);
+                {  // decoder step for the survivors only, as one batch
+                    let pend: Vec<u32> = cur.iter().filter(|h| h.pending).map(|h| h.toks.last().unwrap().id).collect();
+                    let mut decs: Vec<&mut Decoding> = cur.iter_mut().filter(|h| h.pending).map(|h| { h.pending = false; &mut h.dec }).collect();
+                    self.advance_batch(&mut decs, &pend);
+                }
+                let mut stay: Vec<Hyp> = Vec::new(); // zero-duration tokens: same frame, next round
+                let nh = cur.len();
+                let hrows = self.joint_rows(&ep, i, &cur.iter().map(|h| &h.dec).collect::<Vec<_>>());
+                let lgall = out.apply(&hrows, nh);
+                let ldall = dur.apply(&hrows, nh);
+                let (vn, dn) = (lgall.len() / nh, ldall.len() / nh);
+                for (hi, hy) in cur.iter().enumerate() {
+                    let lt = lsm(&lgall[hi * vn..(hi + 1) * vn]);
+                    let ld = lsm(&ldall[hi * dn..(hi + 1) * dn]);
+                    // this hypothesis' best `beam` (token, duration) pairs
+                    let mut cand: Vec<(f32, usize, usize)> = Vec::new();
+                    let mut order: Vec<usize> = (0..lt.len()).collect();
+                    let kk = beam.min(order.len());
+                    order.select_nth_unstable_by(kk - 1, |a, b| lt[*b].partial_cmp(&lt[*a]).unwrap_or(core::cmp::Ordering::Equal));
+                    for &k in &order[..kk] {
+                        for (d, &l) in ld.iter().enumerate() {
+                            if ids[k] == 0 && d == 0 {
+                                continue;
+                            }
+                            cand.push((hy.logp + lt[k] + l, k, d));
+                        }
+                    }
+                    let n = beam.min(cand.len());
+                    cand.select_nth_unstable_by(n - 1, |a, b| b.0.partial_cmp(&a.0).unwrap_or(core::cmp::Ordering::Equal));
+                    for &(score, k, d) in &cand[..n] {
+                        let id = ids[k];
+                        let mut nh = hy.clone();
+                        nh.logp = score;
+                        if id != 0 {
+                            nh.toks.push(Token { id, frame: i as u32, logp: lt[k] });
+                            nh.pending = true;
+                        }
+                        if d == 0 {
+                            push(&mut stay, nh);
+                        } else if i + d >= t {
+                            push(&mut done, nh);
+                        } else {
+                            push(&mut buckets[i + d], nh);
+                        }
+                    }
+                }
+                cur = stay;
+            }
+            for mut hy in cur {  // still on this frame after TDT_MAX_SYM zero-duration rounds: forced on by one frame
+                if hy.pending {
+                    let id = hy.toks.last().map(|x| x.id).unwrap_or(0);
+                    self.advance(&mut hy.dec, id);
+                    hy.pending = false;
+                }
+                if i + 1 >= t { push(&mut done, hy) } else { push(&mut buckets[i + 1], hy) }
+            }
+        }
+        Model::best(&done)
+    }
+
+    fn start_beam(&self) -> Vec<Hyp> {
+        vec![Hyp { dec: Decoding::new(self), logp: 0.0, toks: Vec::new(), pending: false }]
+    }
+
+    fn best(hyps: &[Hyp]) -> Vec<Token> {
+        hyps.iter().max_by(|a, b| a.logp.partial_cmp(&b.logp).unwrap_or(core::cmp::Ordering::Equal)).map(|h| h.toks.clone()).unwrap_or_default()
+    }
+
+    /// TDT greedy (tdt_decode.py): after a token or blank the frame pointer moves on by the predicted duration (a blank
+    /// by at least 1; after TDT_MAX_SYM zero-duration tokens in a row by 1). A jump past this chunk's last frame is
+    /// carried into the next chunk (`dec.skip`).
+    fn greedy_tdt(&self, dur: &Linear, enc: &[f32], t: usize, lang: usize, dec: &mut Decoding, frame0: u32) -> Vec<Token> {
+        let ep = self.joiner.enc.apply(enc, t);
+        let jd = self.joiner.enc.n();
+        let (out, ids) = &self.joiner.out[lang];
+        let mut toks = Vec::new();
+        let mut h = vec![0.0; jd];
+        let argmax = |v: &[f32], from: usize| (from..v.len()).fold(from, |a, j| if v[j] > v[a] { j } else { a });
+        let mut i = dec.skip;
+        while i < t {
+            for (k, v) in h.iter_mut().enumerate() {
+                *v = tanh(ep[i * jd + k] + dec.out[k]);
+            }
+            let logit = out.apply(&h, 1);
+            let dl = dur.apply(&h, 1);
+            let best = argmax(&logit, 0);
+            let id = ids[best];
+            let mut d;
+            if id == 0 {
+                d = argmax(&dl, 1); // a blank always moves on
+                dec.run = 0;
+            } else {
+                d = argmax(&dl, 0);
+                let m = logit[best];
+                let lse = m + logit.iter().map(|v| exp(v - m)).sum::<f32>().ln();
+                toks.push(Token { id, frame: frame0 + i as u32, logp: m - lse });
+                self.advance(dec, id);
+                dec.run = if d == 0 { dec.run + 1 } else { 0 };
+                if dec.run >= TDT_MAX_SYM {
+                    d = 1;
+                    dec.run = 0;
+                }
+            }
+            i += d;
+        }
+        dec.skip = i - t;
+        toks
+    }
+
+
+    /// Second pass: full-context transcription of a finished segment (16 kHz); beam > 1: beam search of that width
+    /// (RNN-T: modified_beam_search; TDT: over tokens and durations), else greedy.
+    pub fn full(&self, audio: &[f32], lang: usize, beam: usize) -> Vec<Token> {
         let fb = Fbank::new();
         let t = Fbank::num_frames(audio.len());
         if t < 16 {
@@ -1063,6 +1386,14 @@ impl Model {
         }
         let feats = fb.frames(audio, 0, t);
         let (enc, te) = self.encode_full(&feats, t, lang);
+        if beam > 1 {
+            if let Some(dur) = &self.dur {
+                return self.beam_tdt(dur, &enc, te, lang, beam);
+            }
+            let mut hyps = self.start_beam();
+            self.beam_rnnt(&enc, te, lang, &mut hyps, 0, beam);
+            return Model::best(&hyps);
+        }
         let mut dec = Decoding::new(self);
         self.greedy(&enc, te, lang, &mut dec, 0)
     }
@@ -1084,9 +1415,20 @@ impl Model {
             let n = te.min(HEAD_K);
             let mut last = vec![0.0; HEAD_K * d];
             last[(HEAD_K - n) * d..].copy_from_slice(&enc[(te - n) * d..te * d]);
+            let ids: Vec<u32> = toks.iter().map(|t| t.id).filter(|&i| i != 12).collect();
             let mut ctx = vec![0u32; self.context];
-            ctx.extend(toks.iter().map(|t| t.id).filter(|&i| i != 12));
-            h.prob(&last, n, &self.decoder_y(&ctx))
+            ctx.extend(&ids);
+            let mut y = self.decoder_y(&ctx);
+            if let Some(l) = &self.lstm {  // hybrid decoder: + the LSTM output after [blank] + the text (eou_head.py)
+                let dd = self.dec_dim;
+                let (mut hs, mut cs) = (vec![0.0; l.hidden], vec![0.0; l.hidden]);
+                for &i in [0].iter().chain(&ids) {
+                    l.step(&self.dec_emb[i as usize * dd..(i as usize + 1) * dd], &mut hs, &mut cs);
+                }
+                let p = l.proj.apply(&hs, 1);
+                y.iter_mut().zip(&p).for_each(|(a, b)| *a += l.gate * b);
+            }
+            h.prob(&last, n, &y)
         });
         (toks, p)
     }
@@ -1106,13 +1448,22 @@ impl Model {
 pub struct Decoding {
     ctx: Vec<u32>,
     out: Vec<f32>,
+    h: Vec<f32>, // LSTM state (empty without the LSTM)
+    c: Vec<f32>,
+    skip: usize, // TDT: frames of the next chunk already jumped over
+    run: usize,  // TDT: zero-duration tokens in a row on the current frame
 }
 
 impl Decoding {
     fn new(m: &Model) -> Decoding {
         let ctx = vec![0; m.context];
-        let out = m.decoder_out(&ctx);
-        Decoding { ctx, out }
+        let n = m.lstm.as_ref().map_or(0, |l| l.hidden);
+        let (mut h, mut c) = (vec![0.0; n], vec![0.0; n]);
+        if let Some(l) = &m.lstm {  // training runs the LSTM over [blank] + labels: the start state has seen blank
+            l.step(&m.dec_emb[..m.dec_dim], &mut h, &mut c);
+        }
+        let out = m.decoder_out(&ctx, &h);
+        Decoding { ctx, out, h, c, skip: 0, run: 0 }
     }
 }
 

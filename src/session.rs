@@ -281,7 +281,7 @@ impl<'m> Session<'m> {
             return;
         }
         let t0 = self.now();
-        let (tk, picked) = self.m.full(&x, &self.langs);
+        let (tk, picked) = self.m.full(&x, &self.langs, self.opt.beam);
         if let Some(l) = picked.filter(|&l| l != self.lang) {
             // the model picked another language: the stream follows
             self.lang = l;

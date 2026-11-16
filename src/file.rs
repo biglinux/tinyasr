@@ -26,6 +26,7 @@ pub struct Transcription<'m> {
     vf: Vec<bool>,
     lang: Lang,
     langs: Vec<Lang>, // the recognizer picks among them for each piece
+    beam: usize,
     open0: usize, // frame where the next piece starts
     ctx: usize,   // frames of left context for it
     ended: bool,
@@ -34,7 +35,8 @@ pub struct Transcription<'m> {
 
 impl<'m> Transcription<'m> {
     /// `audio`: 16 kHz. `langs`: as for [`crate::Session::new`] (with several, the recognizer picks for each piece).
-    pub fn new(m: &'m Models, audio: &[f32], langs: &[Lang]) -> Transcription<'m> {
+    /// `beam`: beam width of the decoding ([`crate::DEFAULT_BEAM`]; 1: greedy, fastest).
+    pub fn new(m: &'m Models, audio: &[f32], langs: &[Lang], beam: usize) -> Transcription<'m> {
         let mut a = audio.to_vec();
         a.resize(a.len().div_ceil(FR as usize) * FR as usize, 0.0);
         // speech flags per 40 ms frame, from p > 0.5 until p < 0.35 (as live)
@@ -50,7 +52,7 @@ impl<'m> Transcription<'m> {
             vf.push(on);
         }
         let langs = allowed(m, langs);
-        Transcription { m, audio: a, vf, lang: langs[0], langs, open0: 0, ctx: 0, ended: true, last_end: 0.0 }
+        Transcription { m, audio: a, vf, lang: langs[0], langs, beam: beam.max(1), open0: 0, ctx: 0, ended: true, last_end: 0.0 }
     }
 
     /// The language (`Model`: of the last piece).
@@ -107,7 +109,7 @@ impl Iterator for Transcription<'_> {
             let full = !end && b >= cap_end && b < n; // cut short: more speech may follow
             let a = self.open0.saturating_sub(self.ctx);
             let (x, map) = compress(&self.audio[a * FR as usize..b * FR as usize], &self.vf[a..b], a as i64);
-            let (tk, picked) = self.m.full(&x, &self.langs);
+            let (tk, picked) = self.m.full(&x, &self.langs, self.beam);
             if let Some(l) = picked {
                 self.lang = l;
             }

@@ -5,6 +5,7 @@
 Demo at: https://dkaraush.github.io/tinyasr/web/
 
 - Small multilingual [models](#models), benchmarked on FLEURS and Common Voice.
+- RNN-T and TDT transducers, stateless or LSTM-hybrid decoders; greedy or beam search (width 4 by default).
 - Punctuation, capitalization and word timestamps.
 - Live streaming with re-decodes of the open sentence, or a full-context pass over a finished recording.
 - Built-in Silero VAD and end-of-turn head: knows when the speaker has finished a sentence.
@@ -21,21 +22,21 @@ cargo build --release --features c-api
 
 ### Models
 
-WER %, second pass / streaming (560 ms).
+WER %, second pass (beam 4) / streaming (greedy)
 
 | Model | Size (gzip) | Language | FLEURS | Common Voice |
 |---|---|---|---|---|
-| `en-ru-uk` (61M) | 29.8 MiB | English | 8.48 / 10.75 | 14.20 / 18.18 |
-|  |  | Russian | 5.52 / 7.05 | 5.12 / 6.70 |
-|  |  | Ukrainian | 6.60 / 8.53 | 7.89 / 9.69 |
-| `en-es-it-pt` (62M) | 30.7 MiB | English | 8.89 / 11.29 | 14.30 / 17.96 |
-|  |  | Spanish | 5.26 / 6.53 | 8.19 / 10.26 |
-|  |  | Italian | 5.03 / 6.33 | 8.96 / 10.97 |
-|  |  | Portuguese | 6.85 / 8.15 | 6.82 / 8.48 |
-| `en-ru-uz` (61M) | 29.6 MiB | Uzbek | 13.95 / 15.61 | 8.80 / 10.12 |
-|  |  | Russian | 6.55 / 8.42 | 6.04 / 7.85 |
-|  |  | English | 9.83 / 12.08 | 15.77 / 19.18 |
-| `en-fa` (60M) | 28.7 MiB | Persian | 9.51 / 10.38 | 15.31 / 16.75 |
-|  |  | English | 8.83 / 11.06 | 14.99 / 18.29 |
-| `en-km` (60M) | 28.7 MiB | Khmer (CER) | 8.34 / 9.95 | — |
-|  |  | English | 9.53 / 11.69 | 15.51 / 18.93 |
+| `en-ru-uk` (63M, TDT + LSTM) | 31.9 MiB | English | 7.62 / 10.46 | 13.53 / 17.54 |
+|  |  | Russian | 5.47 / 7.22 | 4.89 / 7.04 |
+|  |  | Ukrainian | 6.13 / 8.22 | 7.78 / 10.29 |
+| `en-es-it-pt` (62M) | 30.7 MiB | English | 9.05 / 11.29 | 14.08 / 17.96 |
+|  |  | Spanish | 5.15 / 6.53 | 7.82 / 10.26 |
+|  |  | Italian | 4.90 / 6.33 | 8.64 / 10.97 |
+|  |  | Portuguese | 6.63 / 8.15 | 6.63 / 8.48 |
+| `en-ru-uz` (61M) | 29.6 MiB | Uzbek | 13.45 / 15.61 | 8.68 / 10.12 |
+|  |  | Russian | 7.62 / 8.42 | 6.81 / 7.85 |
+|  |  | English | 10.26 / 12.08 | 16.48 / 19.18 |
+| `en-fa` (60M) | 28.7 MiB | Persian | 5.87 / 7.23 | 14.29 / 15.98 |
+|  |  | English | 9.97 / 11.04 | 16.26 / 18.06 |
+| `en-km` (60M) | 28.7 MiB | Khmer (CER) | 8.21 / 9.95 | — |
+|  |  | English | 9.41 / 11.69 | 15.02 / 18.93 |

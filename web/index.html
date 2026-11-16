@@ -64,6 +64,7 @@ progress { width: 160px; height: 8px; vertical-align: middle; }
 // session logic (streaming pass, re-decodes, Silero VAD, end of turn) is in the library; this only moves bytes and JSON.
 let x = null;
 const models = {};  // file -> tinyasr_models pointer
+const BEAM = 0;  // beam width of the full-context pass (0: the library's default, 4; 1: greedy)
 let S = 0, M = 0;
 const mem = () => new Uint8Array(x.memory.buffer);
 function put(b) { const p = x.tinyasr_alloc(b.length); mem().set(b, p); return [p, b.length]; }
@@ -107,14 +108,14 @@ onmessage = ev => {
       stop();
       M = models[m.file];
       const l = cstr(m.langs), s0 = m.start ? cstr(m.start) : null;
-      S = x.tinyasr_session_new(M, l[0], s0 ? s0[0] : 0, x.tinyasr_clock());
+      S = x.tinyasr_session_new(M, l[0], s0 ? s0[0] : 0, x.tinyasr_clock(), BEAM);
       free(l); if (s0) free(s0);
     } else if (m.type === "replay") {
       // auto-detect switched the language: the old session is dropped (no events), a new one hears the recording so far
       if (S) { x.tinyasr_session_free(S); S = 0; }
       M = models[m.file];
       const l = cstr(m.langs), s0 = cstr(m.langs.split(",")[0]);  // start in the first language (the library orders by the model)
-      S = x.tinyasr_session_new(M, l[0], s0[0], x.tinyasr_clock());
+      S = x.tinyasr_session_new(M, l[0], s0[0], x.tinyasr_clock(), BEAM);
       free(l); free(s0);
       const ev = [];
       for (const c of m.chunks) ev.push(...JSON.parse(str(withPcm(c, p => x.tinyasr_session_push(S, p, c.length)))));
@@ -127,7 +128,7 @@ onmessage = ev => {
     } else if (m.type === "file") {
       stop();
       const t = performance.now(), l = cstr(m.langs);
-      const f = withPcm(m.x, p => x.tinyasr_file_new(models[m.file], p, m.x.length, l[0]));
+      const f = withPcm(m.x, p => x.tinyasr_file_new(models[m.file], p, m.x.length, l[0], BEAM));
       free(l);
       for (let r; (r = x.tinyasr_file_next(f));) {
         postMessage({ type: "events", ev: [{ type: "commit", words: JSON.parse(str(r)) }] });
@@ -176,7 +177,7 @@ const esc = s => String(s).replace(/[&<>]/g, c => ({ "&": "&amp;", "<": "&lt;", 
 // (name.gz, unpacked here); a plain file of the name is used when there's no .gz. mb: the download (gzip) size
 const BASE = "../models/";
 const MODELS = [
-  { file: "en-ru-uk.tzf", name: "English, Russian, Ukrainian", langs: ["en", "ru", "uk"], mb: 31.2 },
+  { file: "en-ru-uk.tzf", name: "English, Russian, Ukrainian", langs: ["en", "ru", "uk"], mb: 33.4 },
   { file: "en-es-it-pt.tzf", name: "English, Spanish, Italian, Portuguese", langs: ["en", "es", "it", "pt"], mb: 32.2 },
   { file: "en-ru-uz.tzf", name: "English, Russian, Uzbek", langs: ["en", "ru", "uz"], mb: 31.1 },
   { file: "en-fa.tzf", name: "English, Persian", langs: ["en", "fa"], mb: 30.1 },

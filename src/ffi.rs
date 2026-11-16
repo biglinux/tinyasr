@@ -108,6 +108,12 @@ pub fn events_json(ev: &[Event]) -> String {
     o
 }
 
+/// Version of the library (its API and the model files it reads).
+#[unsafe(no_mangle)]
+pub extern "C" fn tinyasr_version() -> u32 {
+    crate::version()
+}
+
 /// Load the models from memory (copied; the caller may free them after). On failure
 /// returns null and writes the reason (NUL-terminated, truncated) to `err` if not null.
 #[unsafe(no_mangle)]
@@ -163,16 +169,21 @@ pub unsafe extern "C" fn tinyasr_chunk_ms(m: *const Models) -> u32 {
 
 /// A live session. `langs`: the languages to recognize in, comma-separated ("en,ru"; null or "": all). One fixes the
 /// language; with several the recognizer picks among them, starting from `start_lang` (may be null). `clock`: a monotonic clock in seconds, or null (re-decode time is then estimated).
+/// `beam`: beam width of the full-context passes (0: the default, 4; 1: greedy).
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn tinyasr_session_new(
     m: *const Models,
     lang_list: *const c_char,
     start_lang: *const c_char,
     clock: Option<extern "C" fn() -> f64>,
+    beam: u32,
 ) -> *mut CSession {
     // SAFETY: m came from tinyasr_load and outlives the session (the caller's contract).
     let m: &'static Models = unsafe { &*m };
     let mut opt = Options::default();
+    if beam > 0 {
+        opt.beam = beam as usize;
+    }
     // SAFETY: null or NUL-terminated strings.
     if let Some(l) = unsafe { lang(start_lang) } {
         opt.start_lang = l;
@@ -222,13 +233,14 @@ fn lang_str(l: Lang) -> *const c_char {
     [c"en", c"ru", c"uk", c"es", c"it", c"pt", c"uz", c"fa", c"km"][l as usize].as_ptr()
 }
 
-/// A recorded file (n samples, 16 kHz, copied): VAD runs here. `langs` as for sessions.
+/// A recorded file (n samples, 16 kHz, copied): VAD runs here. `langs` and `beam` as for sessions.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn tinyasr_file_new(m: *const Models, pcm: *const f32, n: usize, lang_list: *const c_char) -> *mut CFile {
+pub unsafe extern "C" fn tinyasr_file_new(m: *const Models, pcm: *const f32, n: usize, lang_list: *const c_char, beam: u32) -> *mut CFile {
     // SAFETY: m came from tinyasr_load and outlives the file; pcm points to n floats; lang is null or a C string.
     let m: &'static Models = unsafe { &*m };
     let x = if n == 0 { &[][..] } else { unsafe { core::slice::from_raw_parts(pcm, n) } };
-    let f = Transcription::new(m, x, &unsafe { langs(lang_list) });
+    let beam = if beam > 0 { beam as usize } else { crate::DEFAULT_BEAM };
+    let f = Transcription::new(m, x, &unsafe { langs(lang_list) }, beam);
     Box::into_raw(Box::new(CFile { f, out: Vec::new() }))
 }
 
