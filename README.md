@@ -40,3 +40,9 @@ WER %, second pass (beam 4) / streaming (greedy)
 |  |  | English | 9.97 / 11.04 | 16.26 / 18.06 |
 | `en-km` (60M) | 28.7 MiB | Khmer (CER) | 8.21 / 9.95 | — |
 |  |  | English | 9.41 / 11.69 | 15.02 / 18.93 |
+
+### License
+
+tinyasr, including the model files in `models/`, is licensed under the [GNU General Public License v3.0 or later](LICENSE).
+
+Models were trained primarily on [YODAS v3](https://huggingface.co/datasets/espnet/yodas3) (ESPnet, [CC BY 3.0](https://creativecommons.org/licenses/by/3.0/)), a corpus of Creative Commons-licensed YouTube audio; see the dataset card for per-source attribution. Voice activity detection uses [Silero VAD](https://github.com/snakers4/silero-vad) (MIT).

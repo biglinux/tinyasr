@@ -41,7 +41,7 @@ impl Graph {
         for f in Fields(b) {
             let (num, v) = f?;
             if num == 7 {
-                g.graph(v.bytes()?)?;
+                g.graph(v.bytes()?, 0)?;
                 found = true;
             }
         }
@@ -55,11 +55,15 @@ impl Graph {
         self.tensors.get(name).ok_or("ONNX model: a weight is missing")
     }
 
-    fn graph(&mut self, b: &[u8]) -> Result<(), &'static str> {
+    /// `depth`: how deep in subgraphs (bounded, so a crafted file cannot exhaust the stack).
+    fn graph(&mut self, b: &[u8], depth: usize) -> Result<(), &'static str> {
+        if depth > 8 {
+            return Err("ONNX model: subgraphs nested too deep");
+        }
         for f in Fields(b) {
             let (num, v) = f?;
             match num {
-                1 => self.node(v.bytes()?)?,
+                1 => self.node(v.bytes()?, depth)?,
                 5 => {
                     let (name, t) = tensor(v.bytes()?)?;
                     self.tensors.insert(name, t);
@@ -71,7 +75,7 @@ impl Graph {
     }
 
     /// NodeProto (output 2, op_type 4, attribute 5): a Constant's value, and the tensors of subgraphs (If branches).
-    fn node(&mut self, b: &[u8]) -> Result<(), &'static str> {
+    fn node(&mut self, b: &[u8], depth: usize) -> Result<(), &'static str> {
         let (mut op, mut output, mut value) = (String::new(), None, None);
         for f in Fields(b) {
             let (num, v) = f?;
@@ -84,7 +88,7 @@ impl Graph {
                         let (an, av) = a?;
                         match an {
                             5 => value = Some(tensor(av.bytes()?)?.1),
-                            6 => self.graph(av.bytes()?)?,
+                            6 => self.graph(av.bytes()?, depth + 1)?,
                             _ => {}
                         }
                     }
@@ -109,7 +113,9 @@ fn tensor(b: &[u8]) -> Result<(String, Tensor), &'static str> {
             1 => {
                 let mut d = Vec::new();
                 v.ints(&mut d)?;
-                dims.extend(d.into_iter().map(|x| x as usize));
+                for x in d {
+                    dims.push(usize::try_from(x).map_err(|_| "ONNX model: negative tensor size")?);
+                }
             }
             2 => ty = v.int()?,
             4 => v.floats(&mut floats)?,
@@ -120,7 +126,7 @@ fn tensor(b: &[u8]) -> Result<(String, Tensor), &'static str> {
             _ => {}
         }
     }
-    let n: usize = dims.iter().product();
+    let n = dims.iter().try_fold(1usize, |a, &d| a.checked_mul(d)).ok_or("ONNX model: tensor too large")?;
     let le4 = |c: &[u8]| [c[0], c[1], c[2], c[3]];
     let data = match ty {
         1 if !raw.is_empty() => Data::F32(raw.chunks_exact(4).map(|c| f32::from_le_bytes(le4(c))).collect()),
@@ -235,11 +241,11 @@ impl<'a> Iterator for Fields<'a> {
             let v = match key & 7 {
                 0 => Value::Varint(varint(b, &mut p)?),
                 1 => {
-                    p += 8;
+                    p = p.checked_add(8).filter(|&e| e <= b.len()).ok_or("ONNX model: truncated")?;
                     Value::Fixed64
                 }
                 2 => {
-                    let n = varint(b, &mut p)? as usize;
+                    let n = usize::try_from(varint(b, &mut p)?).map_err(|_| "ONNX model: truncated")?;
                     let end = p.checked_add(n).filter(|&e| e <= b.len()).ok_or("ONNX model: truncated")?;
                     let s = &b[p..end];
                     p = end;

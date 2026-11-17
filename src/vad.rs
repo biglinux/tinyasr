@@ -61,28 +61,26 @@ impl Vad {
             key.push_str(name);
             Ok(g.tensor(&key).map_err(|_| "silero_vad.onnx: weights not found (Silero VAD v5 expected)")?.f32s())
         };
-        let basis = w("stft.forward_basis_buffer")?;
-        if basis.len() != 258 * 256 {
-            return Err("silero_vad.onnx: unexpected STFT size");
-        }
+        // a weight of exactly n values
+        let wn = |name: &str, n: usize| -> Result<Vec<f32>, &'static str> {
+            let v = w(name)?;
+            if v.len() == n { Ok(v) } else { Err("silero_vad.onnx: a weight has an unexpected size (Silero VAD v5 expected)") }
+        };
+        let basis = wn("stft.forward_basis_buffer", 258 * 256)?;
         let mut convs = Vec::new();
         for (i, (cin, cout, stride)) in [(129, 128, 1), (128, 64, 2), (64, 64, 2), (64, 128, 1)].into_iter().enumerate() {
-            let wt = w(&alloc::format!("encoder.{i}.reparam_conv.weight"))?;
-            if wt.len() != cout * cin * 3 {
-                return Err("silero_vad.onnx: unexpected encoder size");
-            }
-            convs.push(Conv { w: Packed::from_rows(&wt, cout, cin * 3), b: w(&alloc::format!("encoder.{i}.reparam_conv.bias"))?, stride });
+            let wt = wn(&alloc::format!("encoder.{i}.reparam_conv.weight"), cout * cin * 3)?;
+            convs.push(Conv { w: Packed::from_rows(&wt, cout, cin * 3), b: wn(&alloc::format!("encoder.{i}.reparam_conv.bias"), cout)?, stride });
         }
-        let (bi, bh) = (w("decoder.rnn.bias_ih")?, w("decoder.rnn.bias_hh")?);
-        let out_b = w("decoder.decoder.2.bias")?;
+        let (bi, bh) = (wn("decoder.rnn.bias_ih", 4 * H)?, wn("decoder.rnn.bias_hh", 4 * H)?);
         Ok(Vad {
             basis: Packed::from_rows(&basis, 258, 256),
             convs,
-            w_ih: Packed::from_rows(&w("decoder.rnn.weight_ih")?, 4 * H, H),
-            w_hh: Packed::from_rows(&w("decoder.rnn.weight_hh")?, 4 * H, H),
+            w_ih: Packed::from_rows(&wn("decoder.rnn.weight_ih", 4 * H * H)?, 4 * H, H),
+            w_hh: Packed::from_rows(&wn("decoder.rnn.weight_hh", 4 * H * H)?, 4 * H, H),
             b: bi.iter().zip(&bh).map(|(a, b)| a + b).collect(),
-            out_w: w("decoder.decoder.2.weight")?,
-            out_b: out_b[0],
+            out_w: wn("decoder.decoder.2.weight", H)?,
+            out_b: wn("decoder.decoder.2.bias", 1)?[0],
         })
     }
 

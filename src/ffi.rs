@@ -25,6 +25,12 @@ unsafe fn bytes<'a>(p: *const u8, n: usize) -> Option<&'a [u8]> {
     if p.is_null() { None } else { Some(unsafe { core::slice::from_raw_parts(p, n) }) }
 }
 
+/// n samples at p; null (or n = 0): none.
+/// # Safety: p is null or points to n floats.
+unsafe fn samples<'a>(p: *const f32, n: usize) -> &'a [f32] {
+    if p.is_null() || n == 0 { &[] } else { unsafe { core::slice::from_raw_parts(p, n) } }
+}
+
 /// # Safety: p is null or a NUL-terminated string.
 unsafe fn lang(p: *const c_char) -> Option<Lang> {
     if p.is_null() {
@@ -163,8 +169,8 @@ pub unsafe extern "C" fn tinyasr_free(m: *mut Models) {
 /// Streaming chunk of the recognizer (ms).
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn tinyasr_chunk_ms(m: *const Models) -> u32 {
-    // SAFETY: m came from tinyasr_load.
-    unsafe { &*m }.chunk_ms()
+    // SAFETY: m is null or came from tinyasr_load.
+    unsafe { m.as_ref() }.map_or(0, |m| m.chunk_ms())
 }
 
 /// A live session. `langs`: the languages to recognize in, comma-separated ("en,ru"; null or "": all). One fixes the
@@ -178,8 +184,10 @@ pub unsafe extern "C" fn tinyasr_session_new(
     clock: Option<extern "C" fn() -> f64>,
     beam: u32,
 ) -> *mut CSession {
-    // SAFETY: m came from tinyasr_load and outlives the session (the caller's contract).
-    let m: &'static Models = unsafe { &*m };
+    // SAFETY: m is null or came from tinyasr_load and outlives the session (the caller's contract).
+    let Some(m): Option<&'static Models> = (unsafe { m.as_ref() }) else {
+        return core::ptr::null_mut();
+    };
     let mut opt = Options::default();
     if beam > 0 {
         opt.beam = beam as usize;
@@ -198,18 +206,21 @@ pub unsafe extern "C" fn tinyasr_session_new(
 /// Feed n samples (16 kHz); returns the events (JSON array).
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn tinyasr_session_push(s: *mut CSession, pcm: *const f32, n: usize) -> *const c_char {
-    // SAFETY: s came from tinyasr_session_new; pcm points to n floats.
-    let s = unsafe { &mut *s };
-    let x = if n == 0 { &[][..] } else { unsafe { core::slice::from_raw_parts(pcm, n) } };
-    let e = events_json(&s.s.push(x));
+    // SAFETY: s is null or came from tinyasr_session_new; pcm is null or points to n floats.
+    let Some(s) = (unsafe { s.as_mut() }) else {
+        return core::ptr::null();
+    };
+    let e = events_json(&s.s.push(unsafe { samples(pcm, n) }));
     put(&mut s.out, &e)
 }
 
 /// End of audio: the last events (everything final).
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn tinyasr_session_finish(s: *mut CSession) -> *const c_char {
-    // SAFETY: s came from tinyasr_session_new.
-    let s = unsafe { &mut *s };
+    // SAFETY: s is null or came from tinyasr_session_new.
+    let Some(s) = (unsafe { s.as_mut() }) else {
+        return core::ptr::null();
+    };
     let e = events_json(&s.s.finish());
     put(&mut s.out, &e)
 }
@@ -217,8 +228,8 @@ pub unsafe extern "C" fn tinyasr_session_finish(s: *mut CSession) -> *const c_ch
 /// The session's language code (static string).
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn tinyasr_session_lang(s: *const CSession) -> *const c_char {
-    // SAFETY: s came from tinyasr_session_new.
-    lang_str(unsafe { &*s }.s.lang())
+    // SAFETY: s is null or came from tinyasr_session_new.
+    unsafe { s.as_ref() }.map_or(core::ptr::null(), |s| lang_str(s.s.lang()))
 }
 
 #[unsafe(no_mangle)]
@@ -236,9 +247,12 @@ fn lang_str(l: Lang) -> *const c_char {
 /// A recorded file (n samples, 16 kHz, copied): VAD runs here. `langs` and `beam` as for sessions.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn tinyasr_file_new(m: *const Models, pcm: *const f32, n: usize, lang_list: *const c_char, beam: u32) -> *mut CFile {
-    // SAFETY: m came from tinyasr_load and outlives the file; pcm points to n floats; lang is null or a C string.
-    let m: &'static Models = unsafe { &*m };
-    let x = if n == 0 { &[][..] } else { unsafe { core::slice::from_raw_parts(pcm, n) } };
+    // SAFETY: m is null or came from tinyasr_load and outlives the file; pcm is null or points to n floats; lang is
+    // null or a C string.
+    let Some(m): Option<&'static Models> = (unsafe { m.as_ref() }) else {
+        return core::ptr::null_mut();
+    };
+    let x = unsafe { samples(pcm, n) };
     let beam = if beam > 0 { beam as usize } else { crate::DEFAULT_BEAM };
     let f = Transcription::new(m, x, &unsafe { langs(lang_list) }, beam);
     Box::into_raw(Box::new(CFile { f, out: Vec::new() }))
@@ -246,15 +260,17 @@ pub unsafe extern "C" fn tinyasr_file_new(m: *const Models, pcm: *const f32, n: 
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn tinyasr_file_lang(f: *const CFile) -> *const c_char {
-    // SAFETY: f came from tinyasr_file_new.
-    lang_str(unsafe { &*f }.f.lang())
+    // SAFETY: f is null or came from tinyasr_file_new.
+    unsafe { f.as_ref() }.map_or(core::ptr::null(), |f| lang_str(f.f.lang()))
 }
 
 /// The next piece's final words (JSON array of {"text", "start", "end"}), or null when the file is done.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn tinyasr_file_next(f: *mut CFile) -> *const c_char {
-    // SAFETY: f came from tinyasr_file_new.
-    let f = unsafe { &mut *f };
+    // SAFETY: f is null or came from tinyasr_file_new.
+    let Some(f) = (unsafe { f.as_mut() }) else {
+        return core::ptr::null();
+    };
     match f.f.next() {
         Some(ws) => {
             let mut o = String::new();
@@ -265,11 +281,14 @@ pub unsafe extern "C" fn tinyasr_file_next(f: *mut CFile) -> *const c_char {
     }
 }
 
-/// How far the file is recognized (0..1).
+/// How far the file is recognized (0..1); -1 for null.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn tinyasr_file_progress(f: *const CFile) -> f32 {
-    // SAFETY: f came from tinyasr_file_new.
-    let f = &unsafe { &*f }.f;
+    // SAFETY: f is null or came from tinyasr_file_new.
+    let Some(f) = (unsafe { f.as_ref() }) else {
+        return -1.0;
+    };
+    let f = &f.f;
     if f.duration() > 0.0 { (f.position() / f.duration()).min(1.0) } else { 1.0 }
 }
 

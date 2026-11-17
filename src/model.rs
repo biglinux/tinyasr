@@ -21,7 +21,7 @@ use alloc::format;
 // ---------------------------------------------------------------------------------------------- weights
 
 pub struct Tensors {
-    pub cfg: BTreeMap<String, i32>,
+    cfg: BTreeMap<String, i32>,
     t: BTreeMap<String, (Vec<usize>, Data)>,
     pub pieces: Vec<String>,
 }
@@ -75,42 +75,55 @@ fn f16(h: u16) -> f32 {
     f32::from_bits(bits)
 }
 
+type R<T> = Result<T, &'static str>;
+
+const TRUNCATED: &str = "model file: truncated";
+const BAD: &str = "model file: corrupted tensor header";
+const MISSING: &str = "model file: a tensor is missing (corrupted or wrong version?)";
+const SHAPE: &str = "model file: a tensor has an unexpected shape (corrupted or wrong version?)";
+const SETTING: &str = "model file: a setting is missing or out of range (corrupted or wrong version?)";
+
 struct Rd<'a> {
     b: &'a [u8],
     p: usize,
 }
 
 impl<'a> Rd<'a> {
-    fn take(&mut self, n: usize) -> Result<&'a [u8], &'static str> {
-        let s = self.b.get(self.p..self.p + n).ok_or("truncated model file")?;
-        self.p += n;
+    fn take(&mut self, n: usize) -> R<&'a [u8]> {
+        let end = self.p.checked_add(n).ok_or(TRUNCATED)?;
+        let s = self.b.get(self.p..end).ok_or(TRUNCATED)?;
+        self.p = end;
         Ok(s)
     }
-    fn u8(&mut self) -> Result<u8, &'static str> {
+    fn align4(&mut self) {
+        self.p = self.p.saturating_add((4 - self.p % 4) % 4);
+    }
+    fn u8(&mut self) -> R<u8> {
         Ok(self.take(1)?[0])
     }
-    fn u16(&mut self) -> Result<usize, &'static str> {
+    fn u16(&mut self) -> R<usize> {
         let s = self.take(2)?;
         Ok(u16::from_le_bytes([s[0], s[1]]) as usize)
     }
-    fn u32(&mut self) -> Result<usize, &'static str> {
+    fn u32(&mut self) -> R<usize> {
         let s = self.take(4)?;
         Ok(u32::from_le_bytes([s[0], s[1], s[2], s[3]]) as usize)
     }
-    fn str(&mut self) -> Result<String, &'static str> {
+    fn str(&mut self) -> R<String> {
         let n = self.u16()?;
-        core::str::from_utf8(self.take(n)?).map(String::from).map_err(|_| "bad utf-8 in model file")
+        core::str::from_utf8(self.take(n)?).map(String::from).map_err(|_| "model file: bad utf-8")
     }
 }
 
 impl Tensors {
-    /// The `.tzf` file written by `export_tzf.py` (TZF1: f32) or `export_tzf2.py` (TZF2: integer weights).
-    pub fn parse(b: &[u8]) -> Result<Tensors, &'static str> {
+    /// The `.tzf` file written by `export_tzf.py` (TZF1: f32) or `export_tzf2.py` (TZF2: integer weights). Every size
+    /// is checked against the file, so a corrupted file is an error here, never a crash.
+    pub fn parse(b: &[u8]) -> R<Tensors> {
         let mut r = Rd { b, p: 0 };
         let v2 = match r.take(4)? {
             b"TZF1" => false,
             b"TZF2" => true,
-            _ => return Err("not a tinyzipf model (TZF1/TZF2)"),
+            _ => return Err("not a tinyasr model file (TZF1/TZF2)"),
         };
         let mut cfg = BTreeMap::new();
         for _ in 0..r.u32()? {
@@ -123,75 +136,97 @@ impl Tensors {
             let k = r.str()?;
             let integer = v2 && r.u8()? == 1;
             let nd = r.u8()? as usize;
-            let dims = (0..nd).map(|_| r.u32()).collect::<Result<Vec<_>, _>>()?;
-            let n: usize = dims.iter().product();
+            let dims = (0..nd).map(|_| r.u32()).collect::<R<Vec<_>>>()?;
+            let n = dims.iter().try_fold(1usize, |a, &d| a.checked_mul(d)).ok_or(BAD)?;
             if !integer {
-                r.p += (4 - r.p % 4) % 4;
-                let raw = r.take(4 * n)?;
+                r.align4();
+                let raw = r.take(n.checked_mul(4).ok_or(BAD)?)?;
                 let v = raw.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
                 t.insert(k, (dims, Data::F32(v)));
                 continue;
             }
             let (bits, group, st) = (r.u8()?, r.u32()?, r.u8()?);
-            r.p += (4 - r.p % 4) % 4;
+            if dims.is_empty() || n == 0 || group == 0 {
+                return Err(BAD);
+            }
+            r.align4();
             let rows = dims[0];
-            let row = (n / rows).div_ceil(group) * group;
+            let row = (n / rows).div_ceil(group).checked_mul(group).ok_or(BAD)?;
+            let total = rows.checked_mul(row).ok_or(BAD)?;
             let q: Vec<i8> = match bits {
-                8 => r.take(rows * row)?.iter().map(|&c| c as i8).collect(),
-                4 => r.take((rows * row).div_ceil(2))?.iter().flat_map(|&c| [(c & 15) as i8 - 8, (c >> 4) as i8 - 8]).take(rows * row).collect(),
-                _ => return Err("unsupported integer width in model file"),
+                8 => r.take(total)?.iter().map(|&c| c as i8).collect(),
+                4 => r.take(total.div_ceil(2))?.iter().flat_map(|&c| [(c & 15) as i8 - 8, (c >> 4) as i8 - 8]).take(total).collect(),
+                _ => return Err("model file: unsupported integer width"),
             };
-            r.p += (4 - r.p % 4) % 4;
-            let ns = rows * row / group;
+            r.align4();
+            let ns = total / group;
             let scale = if st == 1 {
-                r.take(2 * ns)?.chunks_exact(2).map(|c| f16(u16::from_le_bytes([c[0], c[1]]))).collect()
+                r.take(ns.checked_mul(2).ok_or(BAD)?)?.chunks_exact(2).map(|c| f16(u16::from_le_bytes([c[0], c[1]]))).collect()
             } else {
-                r.take(4 * ns)?.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect()
+                r.take(ns.checked_mul(4).ok_or(BAD)?)?.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect()
             };
             t.insert(k, (dims, Data::Int { group, row, scale, q }));
         }
-        let pieces = (0..r.u32()?).map(|_| r.str()).collect::<Result<Vec<_>, _>>()?;
+        let pieces = (0..r.u32()?).map(|_| r.str()).collect::<R<Vec<_>>>()?;
         Ok(Tensors { cfg, t, pieces })
     }
 
-    pub fn c(&self, k: &str) -> usize {
-        self.cfg[k] as usize
+    /// A setting, which must lie in lo..=hi.
+    fn c(&self, k: &str, lo: usize, hi: usize) -> R<usize> {
+        let v = *self.cfg.get(k).ok_or(SETTING)?;
+        usize::try_from(v).ok().filter(|v| (lo..=hi).contains(v)).ok_or(SETTING)
     }
 
-    fn get(&mut self, k: &str) -> (Vec<usize>, Vec<f32>) {
-        let (d, v) = self.t.remove(k).unwrap_or_else(|| panic!("missing tensor {k}"));
-        let v = v.f32(&d);
-        (d, v)
+    fn get(&mut self, k: &str) -> R<(Vec<usize>, Vec<f32>)> {
+        let (d, v) = self.t.remove(k).ok_or(MISSING)?;
+        let v = v.f32(&d); // integer tensors always have a row dimension (parse)
+        Ok((d, v))
     }
 
-    fn vec(&mut self, k: &str) -> Vec<f32> {
-        self.get(k).1
+    /// A tensor of exactly n values.
+    fn vec(&mut self, k: &str, n: usize) -> R<Vec<f32>> {
+        let v = self.get(k)?.1;
+        if v.len() == n { Ok(v) } else { Err(SHAPE) }
     }
 
-    fn scalar(&mut self, k: &str) -> f32 {
-        self.get(k).1[0]
+    /// A tensor of lo..=hi values.
+    fn vec_in(&mut self, k: &str, lo: usize, hi: usize) -> R<Vec<f32>> {
+        let v = self.get(k)?.1;
+        if (lo..=hi).contains(&v.len()) { Ok(v) } else { Err(SHAPE) }
+    }
+
+    fn scalar(&mut self, k: &str) -> R<f32> {
+        Ok(self.vec(k, 1)?[0])
     }
 
     fn has(&self, k: &str) -> bool {
         self.t.contains_key(k)
     }
 
-    /// Integer weights stay integer (`Quant`) when the groups tile the row exactly; otherwise f32.
-    fn linear(&mut self, k: &str, bias: bool) -> Linear {
+    /// `k`.weight (n x kk; n None: any n >= 1) and, with `bias`, `k`.bias (n). Integer weights stay integer (`Quant`)
+    /// when the groups tile the row exactly; otherwise f32.
+    fn linear(&mut self, k: &str, bias: bool, n: Option<usize>, kk: usize) -> R<Linear> {
         let b = if bias { Some(alloc::format!("{k}.bias")) } else { None };
-        self.linear_named(&alloc::format!("{k}.weight"), b.as_deref())
+        self.linear_named(&alloc::format!("{k}.weight"), b.as_deref(), n, kk)
     }
 
     /// As `linear`, for tensors not named X.weight / X.bias (the LSTM's weight_ih_l0 ...).
-    fn linear_named(&mut self, name: &str, bias: Option<&str>) -> Linear {
-        let (d, data) = self.t.remove(name).unwrap_or_else(|| panic!("missing tensor {name}"));
-        let (n, kk): (usize, usize) = (d[0], d[1..].iter().product());
-        let b = bias.map(|k| self.vec(k));
-        let w = match data {
-            Data::Int { group, row, scale, q } if row == kk => Weight::Int(Quant::new(n, kk, group, scale, q)),
-            data => Weight::F32(Packed::from_rows(&data.f32(&d), n, kk)),
+    fn linear_named(&mut self, name: &str, bias: Option<&str>, n: Option<usize>, kk: usize) -> R<Linear> {
+        let (d, data) = self.t.remove(name).ok_or(MISSING)?;
+        let rows = *d.first().ok_or(SHAPE)?;
+        let cols: usize = d[1..].iter().product();
+        if rows == 0 || n.is_some_and(|n| n != rows) || cols != kk || kk == 0 {
+            return Err(SHAPE);
+        }
+        let b = match bias {
+            Some(k) => Some(self.vec(k, rows)?),
+            None => None,
         };
-        Linear { w, b }
+        let w = match data {
+            Data::Int { group, row, scale, q } if row == kk => Weight::Int(Quant::new(rows, kk, group, scale, q)),
+            data => Weight::F32(Packed::from_rows(&data.f32(&d), rows, kk)),
+        };
+        Ok(Linear { w, b })
     }
 }
 
@@ -218,8 +253,8 @@ struct BiasNorm {
 }
 
 impl BiasNorm {
-    fn load(w: &mut Tensors, k: &str) -> BiasNorm {
-        BiasNorm { bias: w.vec(&alloc::format!("{k}.bias")), scale: exp(w.scalar(&alloc::format!("{k}.log_scale"))) }
+    fn load(w: &mut Tensors, k: &str, dim: usize) -> R<BiasNorm> {
+        Ok(BiasNorm { bias: w.vec(&alloc::format!("{k}.bias"), dim)?, scale: exp(w.scalar(&alloc::format!("{k}.log_scale"))?) })
     }
     fn apply(&self, x: &mut [f32]) {
         let d = self.bias.len();
@@ -736,18 +771,23 @@ fn gelu(x: &mut [f32]) {
 }
 
 impl Head {
-    fn load(w: &mut Tensors) -> Option<Head> {
-        if !w.t.contains_key("eou_head.e.0.weight") {
-            return None;
+    /// `enc_dim`: encoder output width, `dec_dim`: decoder output width (before the joiner).
+    fn load(w: &mut Tensors, enc_dim: usize, dec_dim: usize) -> R<Option<Head>> {
+        if !w.has("eou_head.e.0.weight") {
+            return Ok(None);
         }
-        Some(Head {
-            e: w.linear("eou_head.e.0", true),
-            pos: w.vec("eou_head.pos"),
-            att: w.linear("eou_head.att", true),
-            d: w.linear("eou_head.d.0", true),
-            out0: w.linear("eou_head.out.0", true),
-            out2: w.linear("eou_head.out.2", true),
-        })
+        let e = w.linear("eou_head.e.0", true, None, enc_dim)?;
+        let hd = e.n();
+        let d = w.linear("eou_head.d.0", true, None, dec_dim)?;
+        let out0 = w.linear("eou_head.out.0", true, None, 2 * hd + d.n())?;
+        Ok(Some(Head {
+            pos: w.vec("eou_head.pos", HEAD_K * hd)?,
+            att: w.linear("eou_head.att", true, Some(1), hd)?,
+            out2: w.linear("eou_head.out.2", true, None, out0.n())?,
+            e,
+            d,
+            out0,
+        }))
     }
 
     /// enc: HEAD_K x 512 right-aligned (the first HEAD_K - valid rows unused), dec: decoder output before the joiner.
@@ -858,106 +898,173 @@ fn max_symbols() -> usize {
 }
 
 impl Model {
+    /// The recognizer from its .tzf file. Every shape the model runs with is checked here against the settings and
+    /// the other tensors, so a corrupted file or one for another version of the library is an error, never a crash
+    /// later.
     pub fn from_bytes(b: &[u8]) -> Result<Model, &'static str> {
         let mut w = Tensors::parse(b)?;
-        let ns = w.c("n_stacks");
-        let pos_dim = w.c("pos_dim");
-        let mut stacks = Vec::new();
+        let ns = w.c("n_stacks", 1, 16)?;
+        let pos_dim = w.c("pos_dim", 2, 1024)?;
+        let left = w.c("left_context", 0, 1024)?;
+        let chunk = w.c("chunk", 1, 512)?;
+        let context = w.c("context", 1, 16)?;
+        let mut stacks: Vec<Stack> = Vec::new();
         for s in 0..ns {
-            let g = |k: &str| w.c(&format!("{k}.{s}"));
-            let (dim, nl, ds, heads, qd, pd, kernel) =
-                (g("encoder_dim"), g("num_encoder_layers"), g("downsampling_factor"), g("num_heads"), g("query_head_dim"), g("pos_head_dim"), g("cnn_module_kernel"));
+            let g = |w: &Tensors, k: &str, lo, hi| w.c(&format!("{k}.{s}"), lo, hi);
+            let dim = g(&w, "encoder_dim", 4, 4096)?;
+            let nl = g(&w, "num_encoder_layers", 1, 64)?;
+            let ds = g(&w, "downsampling_factor", 1, 64)?;
+            let heads = g(&w, "num_heads", 1, 64)?;
+            let qd = g(&w, "query_head_dim", 1, 1024)?;
+            let pd = g(&w, "pos_head_dim", 1, 1024)?;
+            let kernel = g(&w, "cnn_module_kernel", 1, 255)?;
+            let half = kernel / 2 + 1;
+            let hid = 3 * dim / 4;
             let base = if ds == 1 { format!("encoder.encoders.{s}") } else { format!("encoder.encoders.{s}.encoder") };
-            let mut layers = Vec::new();
+            let mut layers: Vec<Layer> = Vec::new();
             for l in 0..nl {
                 let p = format!("{base}.layers.{l}");
-                let ff = |w: &mut Tensors, n: &str| FeedForward { inp: w.linear(&format!("{p}.{n}.in_proj"), true), out: w.linear(&format!("{p}.{n}.out_proj"), true) };
-                let conv = |w: &mut Tensors, n: &str| Conv {
-                    inp: w.linear(&format!("{p}.{n}.in_proj"), true),
-                    causal_w: transpose(&w.vec(&format!("{p}.{n}.depthwise_conv.causal_conv.weight")), dim, kernel / 2 + 1),
-                    causal_b: w.vec(&format!("{p}.{n}.depthwise_conv.causal_conv.bias")),
-                    chunk_w: transpose(&w.vec(&format!("{p}.{n}.depthwise_conv.chunkwise_conv.weight")), dim, kernel),
-                    chunk_b: w.vec(&format!("{p}.{n}.depthwise_conv.chunkwise_conv.bias")),
-                    scale: {
-                        let sc = w.vec(&format!("{p}.{n}.depthwise_conv.chunkwise_conv_scale"));
-                        let (l, r) = sc.split_at(dim * kernel);
-                        let mut t = transpose(l, dim, kernel);
-                        t.extend(transpose(r, dim, kernel));
-                        t
-                    },
-                    out: w.linear(&format!("{p}.{n}.out_proj"), true),
-                    dim,
-                    kernel,
+                let ff = |w: &mut Tensors, n: &str| -> R<FeedForward> {
+                    let inp = w.linear(&format!("{p}.{n}.in_proj"), true, None, dim)?;
+                    let out = w.linear(&format!("{p}.{n}.out_proj"), true, Some(dim), inp.n())?;
+                    Ok(FeedForward { inp, out })
                 };
-                let sa = |w: &mut Tensors, n: &str| SelfAttn { inp: w.linear(&format!("{p}.{n}.in_proj"), true), out: w.linear(&format!("{p}.{n}.out_proj"), true), heads };
-                layers.push(Layer {
-                    attn: AttnWeights { in_proj: w.linear(&format!("{p}.self_attn_weights.in_proj"), true), pos: w.linear(&format!("{p}.self_attn_weights.linear_pos"), false), heads, qd, pd },
-                    ff1: ff(&mut w, "feed_forward1"),
-                    ff2: ff(&mut w, "feed_forward2"),
-                    ff3: ff(&mut w, "feed_forward3"),
-                    nonlin: NonlinAttn { inp: w.linear(&format!("{p}.nonlin_attention.in_proj"), true), out: w.linear(&format!("{p}.nonlin_attention.out_proj"), true), hid: 3 * dim / 4 },
-                    sa1: sa(&mut w, "self_attn1"),
-                    sa2: sa(&mut w, "self_attn2"),
-                    conv1: conv(&mut w, "conv_module1"),
-                    conv2: conv(&mut w, "conv_module2"),
-                    norm: BiasNorm::load(&mut w, &format!("{p}.norm")),
-                    bypass: w.vec(&format!("{p}.bypass.bypass_scale")),
-                    bypass_mid: w.vec(&format!("{p}.bypass_mid.bypass_scale")),
-                });
+                let conv = |w: &mut Tensors, n: &str| -> R<Conv> {
+                    let q = |x: &str| format!("{p}.{n}.{x}");
+                    let sc = w.vec(&q("depthwise_conv.chunkwise_conv_scale"), 2 * dim * kernel)?;
+                    let (l, r) = sc.split_at(dim * kernel);
+                    let mut scale = transpose(l, dim, kernel);
+                    scale.extend(transpose(r, dim, kernel));
+                    Ok(Conv {
+                        inp: w.linear(&q("in_proj"), true, Some(2 * dim), dim)?,
+                        causal_w: transpose(&w.vec(&q("depthwise_conv.causal_conv.weight"), dim * half)?, dim, half),
+                        causal_b: w.vec(&q("depthwise_conv.causal_conv.bias"), dim)?,
+                        chunk_w: transpose(&w.vec(&q("depthwise_conv.chunkwise_conv.weight"), dim * kernel)?, dim, kernel),
+                        chunk_b: w.vec(&q("depthwise_conv.chunkwise_conv.bias"), dim)?,
+                        scale,
+                        out: w.linear(&q("out_proj"), true, Some(dim), dim)?,
+                        dim,
+                        kernel,
+                    })
+                };
+                let sa = |w: &mut Tensors, n: &str| -> R<SelfAttn> {
+                    let inp = w.linear(&format!("{p}.{n}.in_proj"), true, None, dim)?;
+                    if inp.n() % heads != 0 {
+                        return Err(SHAPE);
+                    }
+                    let out = w.linear(&format!("{p}.{n}.out_proj"), true, Some(dim), inp.n())?;
+                    Ok(SelfAttn { inp, out, heads })
+                };
+                let layer = Layer {
+                    attn: AttnWeights {
+                        in_proj: w.linear(&format!("{p}.self_attn_weights.in_proj"), true, Some(2 * heads * qd + heads * pd), dim)?,
+                        pos: w.linear(&format!("{p}.self_attn_weights.linear_pos"), false, Some(heads * pd), pos_dim)?,
+                        heads,
+                        qd,
+                        pd,
+                    },
+                    ff1: ff(&mut w, "feed_forward1")?,
+                    ff2: ff(&mut w, "feed_forward2")?,
+                    ff3: ff(&mut w, "feed_forward3")?,
+                    nonlin: NonlinAttn {
+                        inp: w.linear(&format!("{p}.nonlin_attention.in_proj"), true, Some(3 * hid), dim)?,
+                        out: w.linear(&format!("{p}.nonlin_attention.out_proj"), true, Some(dim), hid)?,
+                        hid,
+                    },
+                    sa1: sa(&mut w, "self_attn1")?,
+                    sa2: sa(&mut w, "self_attn2")?,
+                    conv1: conv(&mut w, "conv_module1")?,
+                    conv2: conv(&mut w, "conv_module2")?,
+                    norm: BiasNorm::load(&mut w, &format!("{p}.norm"), dim)?,
+                    bypass: w.vec(&format!("{p}.bypass.bypass_scale"), dim)?,
+                    bypass_mid: w.vec(&format!("{p}.bypass_mid.bypass_scale"), dim)?,
+                };
+                // the streaming state of every layer is laid out as layer 0's
+                if let Some(l0) = layers.first() {
+                    if layer.sa1.inp.n() != l0.sa1.inp.n() || layer.sa2.inp.n() != l0.sa2.inp.n() {
+                        return Err(SHAPE);
+                    }
+                }
+                layers.push(layer);
             }
             let (down, combine) = if ds == 1 {
                 (vec![], vec![])
             } else {
-                (softmax(&w.vec(&format!("encoder.encoders.{s}.downsample.bias"))), w.vec(&format!("encoder.encoders.{s}.out_combiner.bypass_scale")))
+                (softmax(&w.vec(&format!("encoder.encoders.{s}.downsample.bias"), ds)?), w.vec(&format!("encoder.encoders.{s}.out_combiner.bypass_scale"), dim)?)
             };
             stacks.push(Stack { layers, dim, ds, down, combine });
         }
-        let out_down = softmax(&w.vec("encoder.downsample_output.bias"));
+        let d0 = stacks[0].dim;
+        let enc_dim = stacks.iter().map(|s| s.dim).max().unwrap_or(d0); // the full-dim output (`encode`)
+        let out_down = softmax(&w.vec_in("encoder.downsample_output.bias", 1, 64)?);
         // front end: im2col weights stay PyTorch (cout, cin*9); `out` takes (f, c) instead of (c, f)
-        let (od, ow) = w.get("encoder_embed.out.weight");
+        let (od, ow) = w.get("encoder_embed.out.weight")?;
+        if od.first() != Some(&d0) || ow.len() != d0 * FW * C3 {
+            return Err(SHAPE);
+        }
+        let ok = FW * C3;
         let mut ow2 = vec![0.0; ow.len()];
-        for n in 0..od[0] {
+        for n in 0..d0 {
             for c in 0..C3 {
                 for f in 0..FW {
-                    ow2[n * od[1] + f * C3 + c] = ow[n * od[1] + c * FW + f];
+                    ow2[n * ok + f * C3 + c] = ow[n * ok + c * FW + f];
                 }
             }
         }
+        let pw1 = w.linear("encoder_embed.convnext.pointwise_conv1", true, None, C3)?;
         let embed = Embed {
-            c0: w.linear("encoder_embed.conv.0", true),
-            c1: w.linear("encoder_embed.conv.4", true),
-            c2: w.linear("encoder_embed.conv.7", true),
-            dw_w: transpose(&w.vec("encoder_embed.convnext.depthwise_conv.weight"), C3, 49),
-            dw_b: w.vec("encoder_embed.convnext.depthwise_conv.bias"),
-            pw1: w.linear("encoder_embed.convnext.pointwise_conv1", true),
-            pw2: w.linear("encoder_embed.convnext.pointwise_conv2", true),
-            out: Linear { w: Weight::F32(Packed::from_rows(&ow2, od[0], od[1])), b: Some(w.vec("encoder_embed.out.bias")) },
-            norm: BiasNorm::load(&mut w, "encoder_embed.out_norm"),
+            c0: w.linear("encoder_embed.conv.0", true, Some(8), 9)?,
+            c1: w.linear("encoder_embed.conv.4", true, Some(32), 8 * 9)?,
+            c2: w.linear("encoder_embed.conv.7", true, Some(C3), 32 * 9)?,
+            dw_w: transpose(&w.vec("encoder_embed.convnext.depthwise_conv.weight", C3 * 49)?, C3, 49),
+            dw_b: w.vec("encoder_embed.convnext.depthwise_conv.bias", C3)?,
+            pw2: w.linear("encoder_embed.convnext.pointwise_conv2", true, Some(C3), pw1.n())?,
+            pw1,
+            out: Linear { w: Weight::F32(Packed::from_rows(&ow2, d0, ok)), b: Some(w.vec("encoder_embed.out.bias", d0)?) },
+            norm: BiasNorm::load(&mut w, "encoder_embed.out_norm", d0)?,
         };
         use crate::Lang;
         // the language set: "lang.K" = Lang index of the K-th language (files from en-ru-uz on); older files by its size
-        let n = w.c("n_langs");
+        let n = w.c("n_langs", 1, Lang::ALL.len())?;
         let langs = if w.cfg.contains_key("lang.0") {
             let mut v = alloc::vec::Vec::new();
             for k in 0..n {
-                let i = *w.cfg.get(&alloc::format!("lang.{k}")).ok_or("missing language code")? as usize;
-                v.push(*Lang::ALL.get(i).ok_or("unknown language code")?);
+                let i = w.c(&alloc::format!("lang.{k}"), 0, Lang::ALL.len() - 1)?;
+                v.push(Lang::ALL[i]);
             }
             v
         } else {
             match n {
                 3 => alloc::vec![Lang::En, Lang::Ru, Lang::Uk],
                 4 => alloc::vec![Lang::En, Lang::Es, Lang::It, Lang::Pt],
-                _ => return Err("unknown language set"),
+                _ => return Err("model file: unknown language set"),
             }
         };
-        let le = w.vec("lang_embed.weight");
-        let d0 = stacks[0].dim;
-        let lang_vec = (0..langs.len()).map(|k| le[k * d0..(k + 1) * d0].to_vec()).collect();
-        let (shared, size) = (w.c("shared") as u32, w.c("lang_size") as u32);
-        let (jd, jw) = w.get("joiner.output_linear.weight");
-        let jb = w.vec("joiner.output_linear.bias");
-        let out = (0..langs.len() as u32)
+        let le = w.get("lang_embed.weight")?.1;
+        if le.len() < n * d0 {
+            return Err(SHAPE);
+        }
+        let lang_vec = (0..n).map(|k| le[k * d0..(k + 1) * d0].to_vec()).collect();
+        // decoder: embedding (vocabulary x dec_dim, dec_dim in groups of 4) and its convolution over `context` tokens
+        let (dd, dec_emb) = w.get("decoder.embedding.weight")?;
+        let dec_dim: usize = dd.get(1..).map_or(0, |r| r.iter().product());
+        if dd.len() < 2 || dec_dim == 0 || dec_dim % 4 != 0 || dd[0] == 0 {
+            return Err(SHAPE);
+        }
+        let dec_conv = w.vec("decoder.conv.weight", dec_dim * 4 * context)?;
+        // joiner: every id a language can emit (< shared + n * lang_size) has an output row and a decoder embedding
+        let shared = w.c("shared", 0, 1 << 16)?;
+        let size = w.c("lang_size", 0, 1 << 16)?;
+        let enc = w.linear("joiner.encoder_proj", true, None, enc_dim)?;
+        let jdim = enc.n();
+        let (jd, jw) = w.get("joiner.output_linear.weight")?;
+        let vocab = jd.first().copied().unwrap_or(0);
+        if vocab == 0 || jw.len() != vocab * jdim || shared + size == 0 || shared + n * size > vocab || vocab > dd[0] {
+            return Err(SHAPE);
+        }
+        let jb = w.vec("joiner.output_linear.bias", vocab)?;
+        let (shared, size) = (shared as u32, size as u32);
+        let out = (0..n as u32)
             .map(|k| {
                 // shared block + English; ґ pieces in the shared block (reserved ids, tok_dir/extra.json) only for Ukrainian
                 let uk_only = |i: u32| i < shared && w.pieces.get(i as usize).is_some_and(|p| p.contains('ґ') || p.contains('Ґ'));
@@ -965,29 +1072,38 @@ impl Model {
                 if k != 0 {
                     ids.extend(shared + k * size..shared + (k + 1) * size);
                 }
-                let mut rows = Vec::with_capacity(ids.len() * jd[1]);
+                let mut rows = Vec::with_capacity(ids.len() * jdim);
                 for &i in &ids {
-                    rows.extend_from_slice(&jw[i as usize * jd[1]..(i as usize + 1) * jd[1]]);
+                    rows.extend_from_slice(&jw[i as usize * jdim..(i as usize + 1) * jdim]);
                 }
                 let b = ids.iter().map(|&i| jb[i as usize]).collect();
-                (Linear { w: Weight::F32(Packed::from_rows(&rows, ids.len(), jd[1])), b: Some(b) }, ids)
+                (Linear { w: Weight::F32(Packed::from_rows(&rows, ids.len(), jdim)), b: Some(b) }, ids)
             })
-            .collect();
-        let joiner = Joiner { enc: w.linear("joiner.encoder_proj", true), dec: w.linear("joiner.decoder_proj", true), out };
-        let dur = if w.has("joiner.duration_linear.weight") { Some(w.linear("joiner.duration_linear", true)) } else { None };
+            .collect::<Vec<_>>();
+        if out.iter().any(|(_, ids)| ids.first() != Some(&0)) {
+            return Err(SHAPE); // the blank (0) is every language's first output
+        }
+        let joiner = Joiner { enc, dec: w.linear("joiner.decoder_proj", true, Some(jdim), dec_dim)?, out };
+        let dur = if w.has("joiner.duration_linear.weight") { Some(w.linear("joiner.duration_linear", true, None, jdim)?) } else { None };
+        if dur.as_ref().is_some_and(|d| d.n() < 2) {
+            return Err(SHAPE);
+        }
         let lstm = if w.has("decoder.lstm.weight_ih_l0") {
-            let mut ih = w.linear_named("decoder.lstm.weight_ih_l0", None);
-            let (b1, b2) = (w.vec("decoder.lstm.bias_ih_l0"), w.vec("decoder.lstm.bias_hh_l0"));
-            ih.b = Some(b1.iter().zip(&b2).map(|(a, b)| a + b).collect());
-            let hh = w.linear_named("decoder.lstm.weight_hh_l0", None);
-            let proj = w.linear_named("decoder.lstm_proj.weight", None);
+            let b2 = w.vec_in("decoder.lstm.bias_hh_l0", 4, 1 << 16)?;
             let hidden = b2.len() / 4;
-            Some(Lstm { ih, hh, proj, gate: w.scalar("decoder.lstm_gate_m.g"), hidden })
+            if b2.len() % 4 != 0 {
+                return Err(SHAPE);
+            }
+            let b1 = w.vec("decoder.lstm.bias_ih_l0", 4 * hidden)?;
+            let mut ih = w.linear_named("decoder.lstm.weight_ih_l0", None, Some(4 * hidden), dec_dim)?;
+            ih.b = Some(b1.iter().zip(&b2).map(|(a, b)| a + b).collect());
+            let hh = w.linear_named("decoder.lstm.weight_hh_l0", None, Some(4 * hidden), hidden)?;
+            let proj = w.linear_named("decoder.lstm_proj.weight", None, Some(dec_dim), hidden)?;
+            Some(Lstm { ih, hh, proj, gate: w.scalar("decoder.lstm_gate_m.g")?, hidden })
         } else {
             None
         };
-        let (dd, dec_emb) = w.get("decoder.embedding.weight");
-        let head = Head::load(&mut w);
+        let head = Head::load(&mut w, enc_dim, dec_dim)?;
         Ok(Model {
             head,
             embed,
@@ -995,15 +1111,15 @@ impl Model {
             out_down,
             lang_vec,
             dec_emb,
-            dec_conv: w.vec("decoder.conv.weight"),
-            dec_dim: dd[1],
-            context: w.c("context"),
+            dec_conv,
+            dec_dim,
+            context,
             joiner,
             lstm,
             dur,
             pos_dim,
-            left: w.c("left_context"),
-            chunk: w.c("chunk"),
+            left,
+            chunk,
             pieces: core::mem::take(&mut w.pieces),
             langs,
         })
@@ -1209,7 +1325,7 @@ impl Model {
                 }
             }
             let n = beam.min(cand.len());
-            cand.select_nth_unstable_by(n - 1, |a, b| b.0.partial_cmp(&a.0).unwrap_or(core::cmp::Ordering::Equal));
+            cand.select_nth_unstable_by(n - 1, |a, b| b.0.total_cmp(&a.0));
             cand.truncate(n);
             let mut next: Vec<Hyp> = Vec::with_capacity(n);
             for &(score, hi, k, lp) in &cand {
@@ -1264,7 +1380,7 @@ impl Model {
                 if cur.is_empty() {
                     break;
                 }
-                cur.sort_by(|a, b| b.logp.partial_cmp(&a.logp).unwrap_or(core::cmp::Ordering::Equal));
+                cur.sort_by(|a, b| b.logp.total_cmp(&a.logp));
                 cur.truncate(beam);
                 {  // decoder step for the survivors only, as one batch
                     let pend: Vec<u32> = cur.iter().filter(|h| h.pending).map(|h| h.toks.last().unwrap().id).collect();
@@ -1284,7 +1400,7 @@ impl Model {
                     let mut cand: Vec<(f32, usize, usize)> = Vec::new();
                     let mut order: Vec<usize> = (0..lt.len()).collect();
                     let kk = beam.min(order.len());
-                    order.select_nth_unstable_by(kk - 1, |a, b| lt[*b].partial_cmp(&lt[*a]).unwrap_or(core::cmp::Ordering::Equal));
+                    order.select_nth_unstable_by(kk - 1, |a, b| lt[*b].total_cmp(&lt[*a]));
                     for &k in &order[..kk] {
                         for (d, &l) in ld.iter().enumerate() {
                             if ids[k] == 0 && d == 0 {
@@ -1294,7 +1410,7 @@ impl Model {
                         }
                     }
                     let n = beam.min(cand.len());
-                    cand.select_nth_unstable_by(n - 1, |a, b| b.0.partial_cmp(&a.0).unwrap_or(core::cmp::Ordering::Equal));
+                    cand.select_nth_unstable_by(n - 1, |a, b| b.0.total_cmp(&a.0));
                     for &(score, k, d) in &cand[..n] {
                         let id = ids[k];
                         let mut nh = hy.clone();
@@ -1331,7 +1447,7 @@ impl Model {
     }
 
     fn best(hyps: &[Hyp]) -> Vec<Token> {
-        hyps.iter().max_by(|a, b| a.logp.partial_cmp(&b.logp).unwrap_or(core::cmp::Ordering::Equal)).map(|h| h.toks.clone()).unwrap_or_default()
+        hyps.iter().max_by(|a, b| a.logp.total_cmp(&b.logp)).map(|h| h.toks.clone()).unwrap_or_default()
     }
 
     /// TDT greedy (tdt_decode.py): after a token or blank the frame pointer moves on by the predicted duration (a blank

@@ -62,7 +62,7 @@ pub const DEFAULT_BEAM: usize = 4;
 
 /// Version of the library (its API and the model files it reads); C: `tinyasr_version()`.
 pub fn version() -> u32 {
-    1
+    2
 }
 
 /// Recognition languages (the order of the model's language embeddings).
