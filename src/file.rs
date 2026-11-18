@@ -86,6 +86,13 @@ impl Iterator for Transcription<'_> {
     type Item = Vec<Word>;
 
     fn next(&mut self) -> Option<Vec<Word>> {
+        let m = self.m;
+        m.with_threads(|| self.next_here())
+    }
+}
+
+impl Transcription<'_> {
+    fn next_here(&mut self) -> Option<Vec<Word>> {
         let n = self.vf.len();
         loop {
             let first = (self.open0..n).find(|&i| self.vf[i])?;

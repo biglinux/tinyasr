@@ -255,6 +255,30 @@ impl<'a> Tensors<'a> {
         self.linear_named(&alloc::format!("{k}.weight"), b.as_deref(), n, kk)
     }
 
+    /// A 3x3 convolution `k` (cout x cin x 3 x 3, with bias) as a Linear over im2col rows with tap-major columns:
+    /// column (a * 3 + b) * cin + ci is PyTorch's ci * 9 + a * 3 + b. Integer weights stay integer when one group
+    /// spans the row (the reordering keeps every group's set of weights); otherwise f32.
+    fn conv_linear(&mut self, k: &str, cout: usize, cin: usize) -> R<Linear> {
+        let kk = 9 * cin;
+        let (d, data) = self.take(&alloc::format!("{k}.weight"))?;
+        if d.first() != Some(&cout) || d[1..].iter().product::<usize>() != kk {
+            return Err(SHAPE);
+        }
+        let b = Some(self.vec(&alloc::format!("{k}.bias"), cout)?);
+        let perm = |p: usize| (p % cin) * 9 + p / cin;
+        let w = match data {
+            Data::Int(q) if q.row == kk && q.group == kk && kk.is_multiple_of(16) => {
+                Weight::Int(Quant::new(cout, kk, kk, q.bits == 4, |j, p| q.code(j, perm(p)), |j, _| q.scale(j, 0)))
+            }
+            data => {
+                let v = data.f32(&d);
+                let pv: Vec<f32> = (0..cout * kk).map(|i| v[(i / kk) * kk + perm(i % kk)]).collect();
+                Weight::F32(Packed::from_rows(&pv, cout, kk))
+            }
+        };
+        Ok(Linear { w, b })
+    }
+
     /// As `linear`, for tensors not named X.weight / X.bias (the LSTM's weight_ih_l0 ...).
     fn linear_named(&mut self, name: &str, bias: Option<&str>, n: Option<usize>, kk: usize) -> R<Linear> {
         let (d, data) = self.t.remove(name).ok_or(MISSING)?;
@@ -335,6 +359,17 @@ fn bypass(orig: &[f32], x: &mut [f32], scale: &[f32]) {
     }
 }
 
+/// x (t rows) += f(x rows, first row, rows) for blocks of rows, one task each: a module's output added to the residual
+/// where it is computed (no separate pass). f may read the block's rows of x (row-wise modules) or ignore them.
+fn add_rows(x: &mut [f32], t: usize, work: usize, f: impl Fn(&[f32], usize, usize) -> Vec<f32> + Sync) {
+    let d = x.len() / t;
+    let rb = crate::par::block_rows(t, RB);
+    crate::par::chunks_mut(x, rb * d, work, |b, xo| {
+        let y = f(xo, b * rb, xo.len() / d);
+        add(xo, &y);
+    });
+}
+
 fn add(x: &mut [f32], y: &[f32]) {
     x.iter_mut().zip(y).for_each(|(a, b)| *a += b);
 }
@@ -359,16 +394,14 @@ struct FeedForward {
 }
 
 impl FeedForward {
-    fn apply(&self, x: &[f32], t: usize) -> Vec<f32> {
+    /// x += FF(x).
+    fn add_to(&self, x: &mut [f32], t: usize) {
         let k = x.len() / t;
-        let mut out = Vec::with_capacity(t * self.out.n());
-        for r0 in (0..t).step_by(RB) {
-            let r = RB.min(t - r0);
-            let mut h = self.inp.apply(&x[r0 * k..(r0 + r) * k], r);
+        add_rows(x, t, 2 * t * k * self.inp.n(), |xb, _, r| {
+            let mut h = self.inp.apply(xb, r);
             swoosh_l(&mut h);
-            out.extend_from_slice(&self.out.apply(&h, r));
-        }
-        out
+            self.out.apply(&h, r)
+        });
     }
 }
 
@@ -397,7 +430,8 @@ struct AttnWeights {
 impl AttnWeights {
     /// Attention weights heads x t x (left + t). `keys`: cached keys (left x heads*qd), updated.
     /// `masked`: key slots to ignore (len left + t).
-    fn apply(&self, x: &[f32], t: usize, keys: Option<&mut Vec<f32>>, left: usize, masked: &[bool], pos_dim: usize) -> Vec<f32> {
+    /// `pe`: encodings of the relative positions -(left + t - 1) ..= t - 1 (`rel_pes`, the same for every layer).
+    fn apply(&self, x: &[f32], t: usize, keys: Option<&mut Vec<f32>>, left: usize, masked: &[bool], pe: &[f32]) -> Vec<f32> {
         let (h, qd, pd) = (self.heads, self.qd, self.pd);
         let y = self.in_proj.apply(x, t);
         let w = y.len() / t;
@@ -410,16 +444,11 @@ impl AttnWeights {
         let tk = left + t;
         // projected encodings of relative positions -(left + t - 1) ..= t - 1
         let np = left + 2 * t - 1;
-        let mut pe = vec![0.0; np * pos_dim];
-        for n in 0..np {
-            rel_pe(n as f32 - (left + t - 1) as f32, pos_dim, &mut pe[n * pos_dim..(n + 1) * pos_dim]);
-        }
-        let p = self.pos.apply(&pe, np);
+        let p = self.pos.apply(pe, np);
         let mut out = vec![0.0; h * t * tk];
-        let mut qh = vec![0.0; t * qd];
-        let mut kh = vec![0.0; tk * qd];
-        let mut pt = vec![0.0; pd * np];
-        for hh in 0..h {
+        // heads: one task each
+        crate::par::chunks_mut(&mut out, t * tk, h * t * tk * (qd + pd), |hh, out| {
+            let (mut qh, mut kh, mut pt) = (vec![0.0; t * qd], vec![0.0; tk * qd], vec![0.0; pd * np]);
             // content scores: Q_h (t x qd) K_h^T, as one product
             for i in 0..t {
                 qh[i * qd..(i + 1) * qd].copy_from_slice(&y[i * w + hh * qd..i * w + (hh + 1) * qd]);
@@ -436,7 +465,7 @@ impl AttnWeights {
                 }
             }
             for i in 0..t {
-                let row = &mut out[(hh * t + i) * tk..(hh * t + i + 1) * tk];
+                let row = &mut out[i * tk..(i + 1) * tk];
                 row.copy_from_slice(&sc[i * tk..(i + 1) * tk]);
                 let n0 = t - 1 - i;
                 for c in 0..pd {
@@ -457,7 +486,7 @@ impl AttnWeights {
                 let inv = 1.0 / s;
                 row.iter_mut().for_each(|v| *v *= inv);
             }
-        }
+        });
         out
     }
 }
@@ -514,15 +543,18 @@ fn transpose(x: &[f32], rows: usize, cols: usize) -> Vec<f32> {
 fn weighted(wts: &[f32], heads: usize, t: usize, tk: usize, v: &[f32], d: usize) -> Vec<f32> {
     let vd = v.len() / tk;
     let mut out = vec![0.0; t * heads * d];
-    let mut vt = vec![0.0; d * tk];
-    for hh in 0..heads {
+    // heads: one task each
+    let per_head = crate::par::map(heads, heads * t * tk * d, |hh| {
         // values of this head, transposed (d x tk): the right-hand matrix of W_h (t x tk) V_h
+        let mut vt = vec![0.0; d * tk];
         for j in 0..tk {
             for c in 0..d {
                 vt[c * tk + j] = v[j * vd + hh * d + c];
             }
         }
-        let o = gemm(&wts[hh * t * tk..(hh + 1) * t * tk], t, &Packed::from_rows(&vt, d, tk), None);
+        gemm(&wts[hh * t * tk..(hh + 1) * t * tk], t, &Packed::from_rows(&vt, d, tk), None)
+    });
+    for (hh, o) in per_head.iter().enumerate() {
         for i in 0..t {
             out[i * heads * d + hh * d..i * heads * d + (hh + 1) * d].copy_from_slice(&o[i * d..(i + 1) * d]);
         }
@@ -537,10 +569,13 @@ struct SelfAttn {
 }
 
 impl SelfAttn {
-    fn apply(&self, x: &[f32], t: usize, wts: &[f32], tk: usize, cache: Option<&mut Vec<f32>>) -> Vec<f32> {
+    /// x += SelfAttn(x).
+    fn add_to(&self, x: &mut [f32], t: usize, wts: &[f32], tk: usize, cache: Option<&mut Vec<f32>>) {
         let v = cat_cache(cache, self.inp.apply(x, t));
         let d = self.inp.n() / self.heads;
-        self.out.apply(&weighted(wts, self.heads, t, tk, &v, d), t)
+        let o = weighted(wts, self.heads, t, tk, &v, d);
+        let k = o.len() / t;
+        add_rows(x, t, t * k * self.out.n(), |_, r0, r| self.out.apply(&o[r0 * k..(r0 + r) * k], r));
     }
 }
 
@@ -551,25 +586,29 @@ struct NonlinAttn {
 }
 
 impl NonlinAttn {
-    /// Uses head 0 of the attention weights.
-    fn apply(&self, x: &[f32], t: usize, wts: &[f32], tk: usize, cache: Option<&mut Vec<f32>>) -> Vec<f32> {
+    /// x += NonlinAttn(x). Uses head 0 of the attention weights.
+    fn add_to(&self, x: &mut [f32], t: usize, wts: &[f32], tk: usize, cache: Option<&mut Vec<f32>>) {
         let hid = self.hid;
         let z = self.inp.apply(x, t);
         let mut xs = vec![0.0; t * hid];
-        for i in 0..t {
-            let r = &z[i * 3 * hid..(i + 1) * 3 * hid];
-            for c in 0..hid {
-                xs[i * hid + c] = r[hid + c] * tanh(r[c]);
+        crate::par::chunks_mut(&mut xs, 64 * hid, t * hid * 16, |b, o| {
+            for (i, row) in o.chunks_exact_mut(hid).enumerate() {
+                let r = &z[(b * 64 + i) * 3 * hid..(b * 64 + i + 1) * 3 * hid];
+                for c in 0..hid {
+                    row[c] = r[hid + c] * tanh(r[c]);
+                }
             }
-        }
+        });
         let xs = cat_cache(cache, xs);
-        let mut o = weighted(&wts[..t * tk], 1, t, tk, &xs, hid);
-        for i in 0..t {
-            for c in 0..hid {
-                o[i * hid + c] *= z[i * 3 * hid + 2 * hid + c];
+        let o = weighted(&wts[..t * tk], 1, t, tk, &xs, hid);
+        add_rows(x, t, t * hid * self.out.n(), |_, r0, r| {
+            let mut ob = o[r0 * hid..(r0 + r) * hid].to_vec();
+            for (i, row) in ob.chunks_exact_mut(hid).enumerate() {
+                let zr = &z[(r0 + i) * 3 * hid + 2 * hid..(r0 + i + 1) * 3 * hid];
+                row.iter_mut().zip(zr).for_each(|(v, z)| *v *= z);
             }
-        }
-        self.out.apply(&o, t)
+            self.out.apply(&ob, r)
+        });
     }
 }
 
@@ -587,17 +626,22 @@ struct Conv {
 }
 
 impl Conv {
-    /// `cache`: the last kernel/2 rows of gated input before this chunk (streaming), updated.
-    fn apply(&self, x: &[f32], t: usize, cache: Option<&mut Vec<f32>>) -> Vec<f32> {
+    /// x += Conv(x). `cache`: the last kernel/2 rows of gated input before this chunk (streaming), updated.
+    fn add_to(&self, x: &mut [f32], t: usize, cache: Option<&mut Vec<f32>>) {
         let (d, k) = (self.dim, self.kernel);
         let lp = k / 2;
-        let z = self.inp.apply(x, t);
+        // input projection and gate, row blocks: one task each
         let mut g = vec![0.0; t * d];
-        for i in 0..t {
-            for c in 0..d {
-                g[i * d + c] = z[i * 2 * d + c] * sigmoid(z[i * 2 * d + d + c]);
+        let rb = crate::par::block_rows(t, RB);
+        crate::par::chunks_mut(&mut g, rb * d, 2 * t * d * d, |b, o| {
+            let r = o.len() / d;
+            let z = self.inp.apply(&x[b * rb * d..(b * rb + r) * d], r);
+            for (row, z) in o.chunks_exact_mut(d).zip(z.chunks_exact(2 * d)) {
+                for c in 0..d {
+                    row[c] = z[c] * sigmoid(z[d + c]);
+                }
             }
-        }
+        });
         // causal part over (left pad or cache) + this input
         let mut pad = match &cache {
             Some(c) => (*c).clone(),
@@ -608,24 +652,27 @@ impl Conv {
             *c = pad[pad.len() - lp * d..].to_vec();
         }
         let half = lp + 1;
-        let mut y = vec![0.0; t * d];
-        let mut b = vec![0.0; d];
-        for i in 0..t {
-            let a = &mut y[i * d..(i + 1) * d];
-            taps(a, &self.causal_b, (0..half).map(|u| (&self.causal_w[u * d..(u + 1) * d], &pad[(i + u) * d..(i + u + 1) * d])));
-            // chunkwise part: centred kernel inside this chunk, zero outside, edge-scaled
-            let (u0, u1) = (lp.saturating_sub(i), k.min(t + lp - i));
-            taps(&mut b, &self.chunk_b, (u0..u1).map(|u| (&self.chunk_w[u * d..(u + 1) * d], &g[(i + u - lp) * d..(i + u - lp + 1) * d])));
-            let (l, r) = if t < k { (Some(i), Some(k - t + i)) } else { ((i < k).then_some(i), (i >= t - k).then(|| i - (t - k))) };
-            let row = |j: Option<usize>, half: usize| j.map(|j| &self.scale[(half * k + j) * d..(half * k + j + 1) * d]);
-            let (le, re) = (row(l, 0), row(r, 1));
-            for c in 0..d {
-                let (le, re) = (le.map_or(0.0, |v| v[c]), re.map_or(0.0, |v| v[c]));
-                a[c] += b[c] * (1.0 + le + re);
+        // depthwise, output projection and the residual, row blocks: one task each
+        add_rows(x, t, t * d * (half + k + d), |_, r0, rows| {
+            let mut yo = vec![0.0; rows * d];
+            let mut b = vec![0.0; d];
+            for i in r0..r0 + rows {
+                let a = &mut yo[(i - r0) * d..(i - r0 + 1) * d];
+                taps(a, &self.causal_b, (0..half).map(|u| (&self.causal_w[u * d..(u + 1) * d], &pad[(i + u) * d..(i + u + 1) * d])));
+                // chunkwise part: centred kernel inside this chunk, zero outside, edge-scaled
+                let (u0, u1) = (lp.saturating_sub(i), k.min(t + lp - i));
+                taps(&mut b, &self.chunk_b, (u0..u1).map(|u| (&self.chunk_w[u * d..(u + 1) * d], &g[(i + u - lp) * d..(i + u - lp + 1) * d])));
+                let (l, r) = if t < k { (Some(i), Some(k - t + i)) } else { ((i < k).then_some(i), (i >= t - k).then(|| i - (t - k))) };
+                let row = |j: Option<usize>, half: usize| j.map(|j| &self.scale[(half * k + j) * d..(half * k + j + 1) * d]);
+                let (le, re) = (row(l, 0), row(r, 1));
+                for c in 0..d {
+                    let (le, re) = (le.map_or(0.0, |v| v[c]), re.map_or(0.0, |v| v[c]));
+                    a[c] += b[c] * (1.0 + le + re);
+                }
             }
-        }
-        swoosh_r(&mut y);
-        self.out.apply(&y, t)
+            swoosh_r(&mut yo);
+            self.out.apply(&yo, rows)
+        });
     }
 }
 
@@ -656,7 +703,7 @@ struct Layer {
 }
 
 impl Layer {
-    fn forward(&self, x: &mut Vec<f32>, t: usize, st: Option<&mut LayerState>, left: usize, masked: &[bool], pos_dim: usize) {
+    fn forward(&self, x: &mut Vec<f32>, t: usize, st: Option<&mut LayerState>, left: usize, masked: &[bool], pe: &[f32]) {
         let orig = x.clone();
         let tk = left + t;
         let (mut key, mut nl, mut v1, mut v2, mut c1, mut c2) = (None, None, None, None, None, None);
@@ -668,26 +715,22 @@ impl Layer {
             c1 = Some(&mut s.conv1);
             c2 = Some(&mut s.conv2);
         }
-        let w = self.attn.apply(x, t, key, left, masked, pos_dim);
-        let y = self.ff1.apply(x, t);
-        add(x, &y);
-        let y = self.nonlin.apply(x, t, &w, tk, nl);
-        add(x, &y);
-        let y = self.sa1.apply(x, t, &w, tk, v1);
-        add(x, &y);
-        let y = self.conv1.apply(x, t, c1);
-        add(x, &y);
-        let y = self.ff2.apply(x, t);
-        add(x, &y);
-        bypass(&orig, x, &self.bypass_mid);
-        let y = self.sa2.apply(x, t, &w, tk, v2);
-        add(x, &y);
-        let y = self.conv2.apply(x, t, c2);
-        add(x, &y);
-        let y = self.ff3.apply(x, t);
-        add(x, &y);
-        self.norm.apply(x);
-        bypass(&orig, x, &self.bypass);
+        let w = self.attn.apply(x, t, key, left, masked, pe);
+        self.ff1.add_to(x, t);
+        self.nonlin.add_to(x, t, &w, tk, nl);
+        self.sa1.add_to(x, t, &w, tk, v1);
+        self.conv1.add_to(x, t, c1);
+        self.ff2.add_to(x, t);
+        let d = x.len() / t;
+        let rb = crate::par::block_rows(t, RB);
+        crate::par::chunks_mut(x, rb * d, 8 * t * d, |b, xo| bypass(&orig[b * rb * d..b * rb * d + xo.len()], xo, &self.bypass_mid));
+        self.sa2.add_to(x, t, &w, tk, v2);
+        self.conv2.add_to(x, t, c2);
+        self.ff3.add_to(x, t);
+        crate::par::chunks_mut(x, rb * d, 8 * t * d, |b, xo| {
+            self.norm.apply(xo);
+            bypass(&orig[b * rb * d..b * rb * d + xo.len()], xo, &self.bypass);
+        });
     }
 }
 
@@ -745,9 +788,17 @@ impl Stack {
 }
 
 fn run(layers: &[Layer], x: &mut Vec<f32>, t: usize, st: Option<&mut [LayerState]>, left: usize, masked: &[bool], pos_dim: usize) {
+    // the relative-position encodings depend on (left, t) alone: once for all the layers of the stack
+    let np = left + 2 * t - 1;
+    let mut pe = vec![0.0; np * pos_dim];
+    crate::par::chunks_mut(&mut pe, 64 * pos_dim, np * pos_dim * 16, |b, o| {
+        for (i, row) in o.chunks_exact_mut(pos_dim).enumerate() {
+            rel_pe((b * 64 + i) as f32 - (left + t - 1) as f32, pos_dim, row);
+        }
+    });
     match st {
-        Some(s) => layers.iter().zip(s.iter_mut()).for_each(|(l, s)| l.forward(x, t, Some(s), left, masked, pos_dim)),
-        None => layers.iter().for_each(|l| l.forward(x, t, None, left, masked, pos_dim)),
+        Some(s) => layers.iter().zip(s.iter_mut()).for_each(|(l, s)| l.forward(x, t, Some(s), left, masked, &pe)),
+        None => layers.iter().for_each(|l| l.forward(x, t, None, left, masked, &pe)),
     }
 }
 
@@ -770,33 +821,50 @@ const FW: usize = 19; // frequency width after the convolutions
 const C3: usize = 128;
 
 /// 3x3 convolution of a channels-last image (t x f x cin), no time padding, `pf` frequency padding.
+/// The front end's 3 convolutions have 1, 8 and 32 input channels: a constant, so the copies of each tap unroll.
 fn conv3(x: &[f32], t: usize, f: usize, cin: usize, lin: &Linear, st: usize, sf: usize, pf: usize) -> (Vec<f32>, usize, usize) {
+    match cin {
+        1 => conv3c::<1>(x, t, f, lin, st, sf, pf),
+        8 => conv3c::<8>(x, t, f, lin, st, sf, pf),
+        32 => conv3c::<32>(x, t, f, lin, st, sf, pf),
+        _ => unreachable!("front-end convolution with {cin} input channels"),
+    }
+}
+
+fn conv3c<const CIN: usize>(x: &[f32], t: usize, f: usize, lin: &Linear, st: usize, sf: usize, pf: usize) -> (Vec<f32>, usize, usize) {
+    let cin = CIN;
     let to = (t - 3) / st + 1;
     let fo = (f + 2 * pf - 3) / sf + 1;
     // output time rows per block: about 256 Ki values of im2col at a time
     let tb = ((1 << 18) / (fo * 9 * cin)).max(1);
-    let mut y = Vec::with_capacity(to * fo * lin.n());
-    let mut col = vec![0.0; tb.min(to) * fo * 9 * cin];
-    for i0 in (0..to).step_by(tb) {
-        let nb = tb.min(to - i0);
+    let n = lin.n();
+    let mut y = vec![0.0; to * fo * n];
+    // blocks of tb output time rows: one task each
+    crate::par::chunks_mut(&mut y, tb * fo * n, to * fo * 9 * cin * n, |blk, yo| {
+        let (i0, nb) = (blk * tb, yo.len() / (fo * n));
+        let mut col = vec![0.0; nb * fo * 9 * cin];
         for i in i0..i0 + nb {
             for j in 0..fo {
                 let row = &mut col[((i - i0) * fo + j) * 9 * cin..((i - i0) * fo + j + 1) * 9 * cin];
-                for ci in 0..cin {
-                    for a in 0..3 {
-                        for b in 0..3 {
-                            let (tt, ff) = (i * st + a, (j * sf + b) as isize - pf as isize);
-                            // PyTorch weight layout (cout, cin, 3, 3) -> column index ci*9 + a*3 + b
-                            row[ci * 9 + a * 3 + b] = if ff >= 0 && (ff as usize) < f { x[(tt * f + ff as usize) * cin + ci] } else { 0.0 };
-                        }
+                // tap-major columns (a * 3 + b) * cin + ci (`Tensors::conv_linear`): each tap is cin contiguous inputs
+                for a in 0..3 {
+                    for b in 0..3 {
+                        let (tt, ff) = (i * st + a, (j * sf + b) as isize - pf as isize);
+                        let d: &mut [f32; CIN] = (&mut row[(a * 3 + b) * cin..(a * 3 + b + 1) * cin]).try_into().unwrap();
+                        *d = if ff >= 0 && (ff as usize) < f {
+                            let s0 = (tt * f + ff as usize) * cin;
+                            x[s0..s0 + cin].try_into().unwrap()
+                        } else {
+                            [0.0; CIN]
+                        };
                     }
                 }
             }
         }
-        let mut yb = lin.apply(&col[..nb * fo * 9 * cin], nb * fo);
+        let mut yb = lin.apply(&col, nb * fo);
         swoosh_r(&mut yb);
-        y.extend_from_slice(&yb);
-    }
+        yo.copy_from_slice(&yb);
+    });
     (y, to, fo)
 }
 
@@ -814,11 +882,12 @@ impl Embed {
     fn convnext(&self, rows: &[f32], t_in: usize) -> Vec<f32> {
         let t = t_in - 6;
         let row = FW * C3;
-        let tb = (RB / FW).max(1); // time rows per block (x 19 frequency rows each)
-        let mut z = Vec::with_capacity(t * row);
-        let mut y = vec![0.0; tb.min(t) * row];
-        for i0 in (0..t).step_by(tb) {
-            let nb = tb.min(t - i0);
+        let tb = (RB / FW).max(1); // time rows per block (x 19 frequency rows each): one task each
+        let mut z = vec![0.0; t * row];
+        let work = t * FW * (2 * C3 * self.pw1.n() + 49 * C3);
+        crate::par::chunks_mut(&mut z, tb * row, work, |blk, zo| {
+            let (i0, nb) = (blk * tb, zo.len() / row);
+            let mut y = vec![0.0; nb * row];
             for i in i0..i0 + nb {
                 for f in 0..FW {
                     let a = &mut y[(i - i0) * row + f * C3..(i - i0) * row + (f + 1) * C3];
@@ -830,12 +899,12 @@ impl Embed {
                     taps(a, &self.dw_b, (0..7).flat_map(|dt| (f0..f1).map(move |df| (dt, df))).map(|(dt, df)| tap(dt, df)));
                 }
             }
-            let mut h = self.pw1.apply(&y[..nb * row], nb * FW);
+            let mut h = self.pw1.apply(&y, nb * FW);
             swoosh_l(&mut h);
             let mut zb = self.pw2.apply(&h, nb * FW);
             add(&mut zb, &rows[(3 + i0) * row..(3 + i0 + nb) * row]);
-            z.extend_from_slice(&zb);
-        }
+            zo.copy_from_slice(&zb);
+        });
         z
     }
 
@@ -975,6 +1044,35 @@ impl Emb {
             Emb::F32(v, d) => v[id * d..(id + 1) * d].to_vec(),
             Emb::I8 { q, s, d } => q[id * d..(id + 1) * d].iter().map(|&c| c as f32 * s[id]).collect(),
         }
+    }
+}
+
+/// LSTM input products (W_ih x + b) by token, for one beam-search pass (a few hundred KiB at most).
+#[derive(Default)]
+struct IhCache {
+    ids: Vec<u32>,
+    rows: Vec<Vec<f32>>,
+}
+
+impl IhCache {
+    const MAX: usize = 64;
+
+    fn has(&self, id: u32) -> bool {
+        self.ids.contains(&id)
+    }
+
+    fn get(&self, id: u32) -> &[f32] {
+        &self.rows[self.ids.iter().position(|&i| i == id).expect("cached")]
+    }
+
+    /// Keeps the newest MAX (the oldest goes: a beam search moves on through the text).
+    fn put(&mut self, id: u32, row: &[f32]) {
+        if self.ids.len() == Self::MAX {
+            self.ids.remove(0);
+            self.rows.remove(0);
+        }
+        self.ids.push(id);
+        self.rows.push(row.to_vec());
     }
 }
 
@@ -1148,9 +1246,9 @@ impl Model {
         };
         let pw1 = w.linear("encoder_embed.convnext.pointwise_conv1", true, None, C3)?;
         let embed = Embed {
-            c0: w.linear("encoder_embed.conv.0", true, Some(8), 9)?,
-            c1: w.linear("encoder_embed.conv.4", true, Some(32), 8 * 9)?,
-            c2: w.linear("encoder_embed.conv.7", true, Some(C3), 32 * 9)?,
+            c0: w.conv_linear("encoder_embed.conv.0", 8, 1)?,
+            c1: w.conv_linear("encoder_embed.conv.4", 32, 8)?,
+            c2: w.conv_linear("encoder_embed.conv.7", C3, 32)?,
             dw_w: transpose(&w.vec("encoder_embed.convnext.depthwise_conv.weight", C3 * 49)?, C3, 49),
             dw_b: w.vec("encoder_embed.convnext.depthwise_conv.bias", C3)?,
             pw2: w.linear("encoder_embed.convnext.pointwise_conv2", true, Some(C3), pw1.n())?,
@@ -1347,7 +1445,7 @@ impl Model {
 
     /// `advance` for several hypotheses at once: the LSTM, its projection and the joiner's decoder projection run as
     /// one batch.
-    fn advance_batch(&self, decs: &mut [&mut Decoding], ids: &[u32]) {
+    fn advance_batch(&self, decs: &mut [&mut Decoding], ids: &[u32], ihc: &mut IhCache) {
         let n = decs.len();
         if n == 0 {
             return;
@@ -1360,13 +1458,35 @@ impl Model {
         }
         if let Some(l) = &self.lstm {
             let hn = l.hidden;
-            let mut x = Vec::with_capacity(n * d);
             let mut hp = Vec::with_capacity(n * hn);
-            for (dec, &id) in decs.iter().zip(ids) {
-                x.extend_from_slice(&self.dec_emb.row(id));
+            for dec in decs.iter() {
                 hp.extend_from_slice(&dec.h);
             }
-            let mut g = l.ih.apply(&x, n);
+            // the input part depends on the token alone: computed once per token in this pass (row-wise, so the
+            // same values as in a batch)
+            let mut new: Vec<u32> = Vec::new();
+            for &id in ids {
+                if !ihc.has(id) && !new.contains(&id) {
+                    new.push(id);
+                }
+            }
+            let gi = if new.is_empty() {
+                Vec::new()
+            } else {
+                let mut x = Vec::with_capacity(new.len() * d);
+                new.iter().for_each(|&id| x.extend_from_slice(&self.dec_emb.row(id)));
+                l.ih.apply(&x, new.len())
+            };
+            let mut g = Vec::with_capacity(n * 4 * hn);
+            for &id in ids {
+                match new.iter().position(|&j| j == id) {
+                    Some(j) => g.extend_from_slice(&gi[j * 4 * hn..(j + 1) * 4 * hn]),
+                    None => g.extend_from_slice(ihc.get(id)),
+                }
+            }
+            for (j, &id) in new.iter().enumerate() {
+                ihc.put(id, &gi[j * 4 * hn..(j + 1) * 4 * hn]);
+            }
             let r = l.hh.apply(&hp, n);
             g.iter_mut().zip(&r).for_each(|(a, b)| *a += b);
             for (b, dec) in decs.iter_mut().enumerate() {
@@ -1463,6 +1583,7 @@ impl Model {
     /// per frame; hypotheses with the same tokens are merged (log-add). Continues from `hyps`.
     fn beam_rnnt(&self, enc: &[f32], t: usize, lang: usize, hyps: &mut Vec<Hyp>, frame0: u32, beam: usize) {
         let ep = self.joiner.enc.apply(enc, t);
+        let mut ihc = IhCache::default();
         let (out, ids) = &self.joiner.out[lang];
         for i in 0..t {
             let mut cand: Vec<(f32, usize, usize, f32)> = Vec::new(); // (score, hyp, output index, token logp)
@@ -1499,13 +1620,14 @@ impl Model {
             }
             let pend: Vec<u32> = next.iter().filter(|h| h.pending).map(|h| h.toks.last().unwrap().id).collect();
             let mut decs: Vec<&mut Decoding> = next.iter_mut().filter(|h| h.pending).map(|h| { h.pending = false; &mut h.dec }).collect();
-            self.advance_batch(&mut decs, &pend);
+            self.advance_batch(&mut decs, &pend, &mut ihc);
             *hyps = next;
         }
     }
 
     fn beam_tdt(&self, dur: &Linear, enc: &[f32], t: usize, lang: usize, beam: usize) -> Vec<Token> {
         let ep = self.joiner.enc.apply(enc, t);
+        let mut ihc = IhCache::default();
         let (out, ids) = &self.joiner.out[lang];
         let lsm = |v: &[f32]| {
             let m = v.iter().cloned().fold(f32::MIN, f32::max);
@@ -1539,7 +1661,7 @@ impl Model {
                 {  // decoder step for the survivors only, as one batch
                     let pend: Vec<u32> = cur.iter().filter(|h| h.pending).map(|h| h.toks.last().unwrap().id).collect();
                     let mut decs: Vec<&mut Decoding> = cur.iter_mut().filter(|h| h.pending).map(|h| { h.pending = false; &mut h.dec }).collect();
-                    self.advance_batch(&mut decs, &pend);
+                    self.advance_batch(&mut decs, &pend, &mut ihc);
                 }
                 let mut stay: Vec<Hyp> = Vec::new(); // zero-duration tokens: same frame, next round
                 let nh = cur.len();

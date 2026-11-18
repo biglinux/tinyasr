@@ -11,8 +11,9 @@
 //!
 //! Every model is a file the caller hands over as bytes ([`Files`]): the recognizer (.tzf, int4, with its end-of-turn
 //! head; uncompressed - the host unzips a .tzf.gz) and Silero VAD straight from its ONNX file. Which languages to recognize
-//! in is the host's choice (it may run a language ID such as tinylid first). Single-threaded: the host calls in from
-//! whatever thread it likes.
+//! in is the host's choice (it may run a language ID such as tinylid first). The host calls in from whatever thread it
+//! likes; the work runs on that thread, or on as many as the host allows ([`Models::set_threads`], or its own
+//! parallel-for: [`Models::set_parallel_for`]), with the same results.
 //!
 //! ```no_run
 //! # let read = |p: &str| std::fs::read(p).unwrap();
@@ -42,6 +43,7 @@ mod file;
 #[cfg(all(not(feature = "std"), not(target_arch = "wasm32"), not(test)))]
 mod no_std_runtime;
 mod onnx;
+mod par;
 mod session;
 mod text;
 mod vad;
@@ -138,6 +140,8 @@ pub struct Files<'a> {
 pub struct Models {
     asr: model::Model,
     vad: Vad,
+    #[cfg(feature = "std")]
+    exec: Option<alloc::sync::Arc<par::Exec>>,
 }
 
 impl Models {
@@ -145,7 +149,33 @@ impl Models {
         Ok(Models {
             asr: crate::model::Model::from_bytes(f.asr)?,
             vad: Vad::from_onnx(f.vad)?,
+            #[cfg(feature = "std")]
+            exec: None,
         })
+    }
+
+    /// Run the bigger steps on up to `threads` threads (1, the default: only the calling one). The extra threads
+    /// start on first use, from the thread that calls in, and inherit its CPU affinity (Linux, Android): pin that
+    /// thread to the cores you want them on. Results are the same for any number of threads.
+    #[cfg(feature = "std")]
+    pub fn set_threads(&mut self, threads: usize) {
+        self.exec = (threads > 1).then(|| alloc::sync::Arc::new(par::Exec::Pool(par::Pool::new(threads))));
+    }
+
+    /// Run the bigger steps through the host's parallel-for instead: `f(n, task)` must call `task(i)` for every i in
+    /// 0..n, possibly at the same time, and return when all have finished. `threads`: how many it runs at once (steps
+    /// too small to be worth splitting stay on one thread).
+    #[cfg(feature = "std")]
+    pub fn set_parallel_for(&mut self, threads: usize, f: impl Fn(usize, &(dyn Fn(usize) + Sync)) + Send + Sync + 'static) {
+        self.exec = (threads > 1).then(|| alloc::sync::Arc::new(par::Exec::Host(alloc::boxed::Box::new(f), threads)));
+    }
+
+    /// Runs `body` with this instance's threads.
+    fn with_threads<R>(&self, body: impl FnOnce() -> R) -> R {
+        #[cfg(feature = "std")]
+        return par::enter(self.exec.as_ref(), body);
+        #[cfg(not(feature = "std"))]
+        body()
     }
 
     /// The languages of the recognizer: en, ru, uk; en, es, it, pt; en, ru, uz; en, fa; or en, km.

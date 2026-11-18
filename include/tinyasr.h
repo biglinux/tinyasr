@@ -1,5 +1,6 @@
 /* tinyasr: on-device speech recognition (streaming with pause / end-of-turn detection, or a whole file).
- * Audio: mono float, 16 kHz, [-1, 1]. Not thread-safe per object; models can serve several sessions.
+ * Audio: mono float, 16 kHz, [-1, 1]. Not thread-safe per object; models can serve several sessions (each call runs
+ * on the caller's thread, or on more: see tinyasr_set_threads).
  * Returned strings are UTF-8 JSON owned by the object, valid until its next call.
  * Model files are checked when loaded: a corrupted file, or one for another version, makes tinyasr_load return NULL
  * with the reason; it never crashes. Every function accepts NULL for its object and then does nothing: it returns
@@ -25,6 +26,71 @@ tinyasr_models *tinyasr_load(const uint8_t *asr, size_t asr_len, const uint8_t *
                              size_t err_len);
 void tinyasr_free(tinyasr_models *m);
 uint32_t tinyasr_chunk_ms(const tinyasr_models *m); /* 0 for NULL */
+
+/* Threads. By default every call runs on the thread that makes it. The bigger steps of a pass (matrix products,
+ * attention heads, row blocks of a layer) can be split over more threads instead, with the same results to the bit for
+ * any number of threads. Two ways, set on the models while no session or file of them is running (simplest: right
+ * after tinyasr_load):
+ *
+ * tinyasr_set_threads(m, n): the library's own n - 1 extra threads (n = 0, 1: none). They start on the first parallel
+ *   step, from the thread that makes that call, and inherit its CPU affinity (Linux, Android): pin that thread to the
+ *   cores you want and the extra threads follow. Between steps they spin briefly (~0.1 ms), then sleep; tinyasr_free
+ *   ends them.
+ * tinyasr_set_parallel_for(m, parallel_for, user, n): your own pool runs the tasks; the library starts no thread.
+ *   parallel_for(user, count, task, ctx) must call task(ctx, i) for every i in [0, count) - from any threads, in any
+ *   order, possibly at the same time - and return when all have finished. It may be called from any thread, also from
+ *   several at once (sessions of the same models on different threads). task must not call back into tinyasr. n: how
+ *   many tasks run at once (steps too small to be worth splitting stay on the calling thread). NULL: back to one thread.
+ *
+ * How many: the cores of the fastest cluster. Steps wait for their slowest task, so mixing big and little cores (or two
+ * clusters) is often slower than the big ones alone. Measured: Snapdragon 8 Elite, 2 threads on its 2 prime cores:
+ * ~1.5x (more threads: no faster); Apple M5 Pro, 4 threads: ~2x on files, ~1.7x streaming. Builds without std: one
+ * thread, both functions do nothing.
+ *
+ * Android: pin the thread that calls tinyasr to the big cores (cpu_capacity close to the largest), then give that many
+ * threads. Call this on that thread before the first session / file call:
+ *
+ *     #define _GNU_SOURCE
+ *     #include <sched.h>
+ *     #include <stdio.h>
+ *     static int pin_to_big_cores(void) {           // returns the number of big cores (0: unknown, nothing pinned)
+ *         int cap[CPU_SETSIZE], n = 0, max = 0, big = 0;
+ *         for (; n < CPU_SETSIZE; n++) {
+ *             char path[64];
+ *             snprintf(path, sizeof path, "/sys/devices/system/cpu/cpu%d/cpu_capacity", n);
+ *             FILE *f = fopen(path, "r");
+ *             if (f == NULL) break;
+ *             if (fscanf(f, "%d", &cap[n]) != 1) cap[n] = 0;
+ *             fclose(f);
+ *             if (cap[n] > max) max = cap[n];
+ *         }
+ *         cpu_set_t set;
+ *         CPU_ZERO(&set);
+ *         for (int i = 0; i < n; i++) if (max > 0 && cap[i] * 10 >= max * 9) { CPU_SET(i, &set); big++; }
+ *         if (big > 0) sched_setaffinity(0, sizeof set, &set);
+ *         return big;
+ *     }
+ *     ...
+ *     int big = pin_to_big_cores();               // on the thread that will call tinyasr
+ *     tinyasr_set_threads(m, big > 0 ? big : 1);  // then sessions / files as usual, from this thread
+ *
+ * Apple (iOS, macOS): run the calls on a thread or queue of high QoS (user-initiated or user-interactive), and either
+ * tinyasr_set_threads(m, P) with P = sysctlbyname("hw.perflevel0.physicalcpu") (the performance cores), or GCD, whose
+ * dispatch_apply_f has exactly the task signature:
+ *
+ *     #include <dispatch/dispatch.h>
+ *     static void gcd_parallel_for(void *user, size_t n, tinyasr_task task, void *ctx) {
+ *         dispatch_apply_f(n, DISPATCH_APPLY_AUTO, ctx, task);   // returns when all n have run
+ *     }
+ *     ...
+ *     tinyasr_set_parallel_for(m, gcd_parallel_for, NULL, P);
+ *
+ * With the built-in threads, one parallel step of the models runs at a time: a session on another thread that reaches
+ * a step meanwhile runs that step on its own thread (correct, just not split). */
+typedef void (*tinyasr_task)(void *ctx, size_t i);
+typedef void (*tinyasr_parallel_for)(void *user, size_t n, tinyasr_task task, void *ctx);
+void tinyasr_set_threads(tinyasr_models *m, uint32_t threads);
+void tinyasr_set_parallel_for(tinyasr_models *m, tinyasr_parallel_for parallel_for, void *user, uint32_t threads);
 
 /* Live audio. langs: the languages to recognize in, comma-separated ("en", "en,ru"; NULL or "": all), e.g. from a
  * language ID the host runs. One fixes the language; with several every full-context pass runs in each of them and

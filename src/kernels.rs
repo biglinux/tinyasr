@@ -76,13 +76,16 @@ impl Panels for Packed {
 }
 
 /// The cache-blocked loop around the micro-kernel: blocks of MB rows of `a`, one weight panel at a time.
-fn blocked(a: &[f32], b: &impl Panels, bias: Option<&[f32]>, out: &mut [f32]) {
+fn blocked(a: &[f32], b: &(impl Panels + Sync), bias: Option<&[f32]>, out: &mut [f32]) {
     let (n, k) = (b.n(), b.k());
     let m = a.len() / k;
-    let mut tile = [[0f32; NR]; MR];
-    let mut scratch = vec![0f32; k * NR];
-    for i0 in (0..m).step_by(MB) {
-        let i1 = (i0 + MB).min(m);
+    // blocks of rows are independent: one task each
+    let mb = crate::par::block_rows(m, MB);
+    crate::par::chunks_mut(out, mb * n, m * n * k, |blk, out| {
+        let i0 = blk * mb;
+        let i1 = (i0 + mb).min(m);
+        let mut tile = [[0f32; NR]; MR];
+        let mut scratch = vec![0f32; k * NR];
         for jp in 0..n.div_ceil(NR) {
             let panel = b.panel(jp, &mut scratch);
             let j0 = jp * NR;
@@ -104,12 +107,13 @@ fn blocked(a: &[f32], b: &impl Panels, bias: Option<&[f32]>, out: &mut [f32]) {
                     }
                 }
                 for r in 0..rows {
-                    out[(i + r) * n + j0..(i + r) * n + j0 + cols].copy_from_slice(&tile[r][..cols]);
+                    let o = (i + r - i0) * n + j0;
+                    out[o..o + cols].copy_from_slice(&tile[r][..cols]);
                 }
                 i += rows;
             }
         }
-    }
+    });
 }
 
 /// out = init + rows(a) x panel, for R rows of `a` (each k long) and one panel of NR columns.
@@ -134,7 +138,7 @@ fn kernel<const R: usize>(a: &[f32], k: usize, panel: &[f32], init: &[f32; NR], 
 #[inline(always)]
 #[allow(unsafe_code)]
 fn kernel<const R: usize>(a: &[f32], k: usize, panel: &[f32], init: &[f32; NR], out: &mut [[f32; NR]; R]) {
-    use core::arch::aarch64::{float32x4_t, vdupq_n_f32, vfmaq_f32, vld1q_f32, vst1q_f32};
+    use core::arch::aarch64::{float32x4_t, vdupq_n_f32, vfmaq_f32, vfmaq_laneq_f32, vld1q_f32, vst1q_f32};
     const { assert!(NR == 16) };
     assert!(a.len() >= R * k && panel.len() >= k * NR);
     // SAFETY: NEON is mandatory on aarch64; every load/store stays inside the slices checked above
@@ -144,7 +148,30 @@ fn kernel<const R: usize>(a: &[f32], k: usize, panel: &[f32], init: &[f32; NR], 
         let start: [float32x4_t; 4] = [vld1q_f32(ip), vld1q_f32(ip.add(4)), vld1q_f32(ip.add(8)), vld1q_f32(ip.add(12))];
         let mut acc = [start; R];
         let (ap, bp) = (a.as_ptr(), panel.as_ptr());
-        for p in 0..k {
+        // 4 k at a time: one load of each row's 4 values, used by lane (the same multiply-adds in the same order)
+        macro_rules! step {
+            ($l:literal, $p:expr, $av:expr) => {
+                let b = bp.add($p * NR);
+                let (b0, b1, b2, b3) = (vld1q_f32(b), vld1q_f32(b.add(4)), vld1q_f32(b.add(8)), vld1q_f32(b.add(12)));
+                for (acc, x) in acc.iter_mut().zip($av.iter()) {
+                    acc[0] = vfmaq_laneq_f32::<$l>(acc[0], b0, *x);
+                    acc[1] = vfmaq_laneq_f32::<$l>(acc[1], b1, *x);
+                    acc[2] = vfmaq_laneq_f32::<$l>(acc[2], b2, *x);
+                    acc[3] = vfmaq_laneq_f32::<$l>(acc[3], b3, *x);
+                }
+            };
+        }
+        let k4 = k / 4 * 4;
+        let mut p = 0;
+        while p < k4 {
+            let av: [float32x4_t; R] = core::array::from_fn(|r| vld1q_f32(ap.add(r * k + p)));
+            step!(0, p, av);
+            step!(1, p + 1, av);
+            step!(2, p + 2, av);
+            step!(3, p + 3, av);
+            p += 4;
+        }
+        for p in k4..k {
             let b = bp.add(p * NR);
             let (b0, b1, b2, b3) = (vld1q_f32(b), vld1q_f32(b.add(4)), vld1q_f32(b.add(8)), vld1q_f32(b.add(12)));
             for (r, acc) in acc.iter_mut().enumerate() {
@@ -263,6 +290,7 @@ pub fn tanh(x: f32) -> f32 {
 
 /// How `Quant` multiplies, picked once from the CPU.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[allow(dead_code)] // each target builds only its own paths
 pub enum Path {
     /// Weights widened to f32, float micro-kernel (exact; no activation quantization).
     F32,
@@ -275,7 +303,6 @@ pub enum Path {
     /// aarch64 `smmla` (ARMv8.6 i8mm).
     Mmla,
     /// wasm SIMD128: widening multiplies (`i16x8.extmul_*_i8x16_s`).
-    #[cfg_attr(not(all(target_arch = "wasm32", target_feature = "simd128")), allow(dead_code))]
     Wasm,
 }
 
@@ -463,54 +490,91 @@ impl Quant {
             return out;
         }
         let (n, k, g) = (self.n, self.k, self.group);
-        let ng = k / g;
-        let act = pack_act(a, m, k, g, path == Path::Dot);
+        let dot = path == Path::Dot;
         let pairs = m.div_ceil(2);
-        let pb = self.panel_bytes();
-        let zero = vec![0f32; if bias.is_some() { 0 } else { n.div_ceil(8) * 8 }];
+        let np = n.div_ceil(8);
+        let zero = vec![0f32; if bias.is_some() { 0 } else { np * 8 }];
         let bias = bias.unwrap_or(&zero);
+        let work = m * n * k;
         const MBP: usize = 16; // row pairs per cache block (32 rows: 16 KiB of activations at k = 512)
-        for p0 in (0..pairs).step_by(MBP) {
-            let p1 = (p0 + MBP).min(pairs);
-            for jp in 0..n.div_ceil(8) {
-                let w = &self.w[jp * pb..(jp + 1) * pb];
-                let sw = &self.s[jp * ng * 8..(jp + 1) * ng * 8];
-                let mut p = p0;
-                while p < p1 {
-                    let rp = if path == Path::Mmla && p1 - p >= 4 { 4 } else if p1 - p >= 2 { 2 } else { 1 };
-                    let a = &act.q[p * 2 * k..(p + rp) * 2 * k];
-                    let sa = &act.s[p * ng * 4..(p + rp) * ng * 4];
-                    let mut t = [[[0f32; 4]; 4]; RPMAX];
-                    tile(path, rp, self.int4, a, sa, w, sw, k, g, &mut t);
-                    let j0 = jp * 8;
-                    for (r, t) in t.iter().enumerate().take(rp) {
-                        let r0 = 2 * (p + r);
-                        if r0 + 2 <= m && j0 + 8 <= n {
-                            // whole block: row r0 is lanes 0, 1 of every pair, row r0 + 1 lanes 2, 3
-                            let b = &bias[j0..j0 + 8];
-                            for h in 0..2 {
-                                let o = &mut out[(r0 + h) * n + j0..(r0 + h) * n + j0 + 8];
-                                for pp in 0..4 {
-                                    o[2 * pp] = t[pp][2 * h] + b[2 * pp];
-                                    o[2 * pp + 1] = t[pp][2 * h + 1] + b[2 * pp + 1];
-                                }
+        let mbp = crate::par::block_rows(2 * pairs, 2 * MBP) / 2;
+        let threads = crate::par::threads();
+        if threads > 1 && pairs.div_ceil(mbp) < 2 * threads && np >= 2 * threads && work >= crate::par::MIN_WORK {
+            // few rows (streaming chunks, decoding): groups of output panels instead, one task each, into their own
+            // columns
+            let act = pack_act(a, m, k, g, dot);
+            let pg = np.div_ceil(4 * threads);
+            let parts = crate::par::map(np.div_ceil(pg), work, |grp| {
+                let (jp0, jp1) = (grp * pg, (grp * pg + pg).min(np));
+                let w = (jp1 - jp0) * 8;
+                let mut o = vec![0f32; m * w];
+                self.block(path, &act, 0, pairs, m, jp0, jp1, bias, &mut o, 0, jp0 * 8, w);
+                o
+            });
+            for (grp, o) in parts.iter().enumerate() {
+                let j0 = grp * pg * 8;
+                let w = o.len() / m;
+                let c = w.min(n - j0);
+                for r in 0..m {
+                    out[r * n + j0..r * n + j0 + c].copy_from_slice(&o[r * w..r * w + c]);
+                }
+            }
+            return out;
+        }
+        // blocks of row pairs are independent: one task each, which quantizes its own rows
+        crate::par::chunks_mut(&mut out, 2 * mbp * n, work, |blk, out| {
+            let (p0, r0) = (blk * mbp, 2 * blk * mbp); // first pair, first row of the block
+            let rows = out.len() / n;
+            let act = pack_act(&a[r0 * k..(r0 + rows) * k], rows, k, g, dot);
+            self.block(path, &act, p0, (p0 + mbp).min(pairs), m, 0, np, bias, out, r0, 0, n);
+        });
+        out
+    }
+
+    /// Row pairs p0..p1 x output panels jp0..jp1 into `out` (row r, column j at (r - r0) * stride + j - c0). `act`
+    /// holds the rows from pair p0 on; `m`: all rows of the product.
+    #[allow(clippy::too_many_arguments)]
+    fn block(&self, path: Path, act: &Act, p0: usize, p1: usize, m: usize, jp0: usize, jp1: usize, bias: &[f32], out: &mut [f32], r0: usize, c0: usize, stride: usize) {
+        let (n, k, g) = (self.n, self.k, self.group);
+        let ng = k / g;
+        let pb = self.panel_bytes();
+        for jp in jp0..jp1 {
+            let w = &self.w[jp * pb..(jp + 1) * pb];
+            let sw = &self.s[jp * ng * 8..(jp + 1) * ng * 8];
+            let j0 = jp * 8;
+            let mut p = p0;
+            while p < p1 {
+                let rp = if path == Path::Mmla && p1 - p >= 4 { 4 } else if p1 - p >= 2 { 2 } else { 1 };
+                let (a, sa) = (&act.q[(p - p0) * 2 * k..(p - p0 + rp) * 2 * k], &act.s[(p - p0) * ng * 4..(p - p0 + rp) * ng * 4]);
+                let mut t = [[[0f32; 4]; 4]; RPMAX];
+                tile(path, rp, rp == 1 && 2 * p + 1 == m, self.int4, a, sa, w, sw, k, g, &mut t);
+                for (r, t) in t.iter().enumerate().take(rp) {
+                    let rr = 2 * (p + r);
+                    if rr + 2 <= m && j0 + 8 <= n {
+                        // whole block: row rr is lanes 0, 1 of every pair, row rr + 1 lanes 2, 3
+                        let b = &bias[j0..j0 + 8];
+                        for h in 0..2 {
+                            let o0 = (rr + h - r0) * stride + j0 - c0;
+                            let o = &mut out[o0..o0 + 8];
+                            for pp in 0..4 {
+                                o[2 * pp] = t[pp][2 * h] + b[2 * pp];
+                                o[2 * pp + 1] = t[pp][2 * h + 1] + b[2 * pp + 1];
                             }
-                            continue;
                         }
-                        for (pp, t) in t.iter().enumerate() {
-                            for (lane, &(ri, oi)) in MMLA_LANES.iter().enumerate() {
-                                let (row, o) = (r0 + ri, j0 + 2 * pp + oi);
-                                if row < m && o < n {
-                                    out[row * n + o] = t[lane] + bias[o];
-                                }
+                        continue;
+                    }
+                    for (pp, t) in t.iter().enumerate() {
+                        for (lane, &(ri, oi)) in MMLA_LANES.iter().enumerate() {
+                            let (row, o) = (rr + ri, j0 + 2 * pp + oi);
+                            if row < m && o < n {
+                                out[(row - r0) * stride + o - c0] = t[lane] + bias[o];
                             }
                         }
                     }
-                    p += rp;
                 }
+                p += rp;
             }
         }
-        out
     }
 }
 
@@ -536,9 +600,15 @@ fn pack_act(a: &[f32], m: usize, k: usize, g: usize, dot: bool) -> Act {
             let sv = &mut s[(p * ng + c) * 4..(p * ng + c + 1) * 4];
             let lanes = if dot { &DOT_LANES } else { &MMLA_LANES };
             for (l, &(ri, _)) in lanes.iter().enumerate() {
-                if ri == h {
+                // `dot`: a lone last row fills the whole pair (both halves are it: see `neon::dot`, SINGLE)
+                if ri == h || dot && r + 1 == m && h == 0 {
                     sv[l] = max / 127.0;
                 }
+            }
+        }
+        if dot && r + 1 == m && h == 0 {
+            for st in 0..k / 8 {
+                dst.copy_within(st * 16..st * 16 + 8, st * 16 + 8);
             }
         }
     }
@@ -581,8 +651,9 @@ fn quant8(x: &[f32], inv: f32, out: &mut [i8]) {
 /// One kernel call: rp (1, 2) row pairs x the 4 output pairs of one panel, 2 x 2 blocks of f32 into t[row pair][pair].
 #[allow(clippy::too_many_arguments)]
 #[inline(always)]
-fn tile(path: Path, rp: usize, int4: bool, a: &[i8], sa: &[f32], w: &[u8], sw: &[f32], k: usize, g: usize, t: &mut [[[f32; 4]; 4]; RPMAX]) {
+fn tile(path: Path, rp: usize, single: bool, int4: bool, a: &[i8], sa: &[f32], w: &[u8], sw: &[f32], k: usize, g: usize, t: &mut [[[f32; 4]; 4]; RPMAX]) {
     let ng = k / g;
+    let _ = single; // the `sdot` path only
     assert!((1..=RPMAX).contains(&rp) && (rp <= 2 || path == Path::Mmla) && a.len() >= rp * 2 * k && sa.len() >= rp * ng * 4);
     assert!(w.len() >= k * if int4 { 4 } else { 8 } && sw.len() >= ng * 8 && g.is_multiple_of(16) && k.is_multiple_of(g));
     match path {
@@ -603,6 +674,14 @@ fn tile(path: Path, rp: usize, int4: bool, a: &[i8], sa: &[f32], w: &[u8], sw: &
                     };
                 }
                 match path {
+                    Path::Dot if single => {
+                        // one row (packed twice): the diagonal sdot gives both of its outputs per pair
+                        if int4 {
+                            neon::dot::<1, true, true>(a.as_ptr(), sa.as_ptr(), w.as_ptr(), sw.as_ptr(), k, g, t)
+                        } else {
+                            neon::dot::<1, false, true>(a.as_ptr(), sa.as_ptr(), w.as_ptr(), sw.as_ptr(), k, g, t)
+                        }
+                    }
                     Path::Mmla if rp == 4 => {
                         if int4 {
                             neon::mmla::<4, true>(a.as_ptr(), sa.as_ptr(), w.as_ptr(), sw.as_ptr(), k, g, t)
@@ -611,7 +690,7 @@ fn tile(path: Path, rp: usize, int4: bool, a: &[i8], sa: &[f32], w: &[u8], sw: &
                         }
                     }
                     Path::Mmla => go!(mmla),
-                    Path::Dot => go!(dot),
+                    Path::Dot => go!(dot2),
                     _ => go!(plain),
                 }
             }
@@ -758,8 +837,17 @@ mod neon {
 
     /// dotprod: per (row pair, output pair) and 8 k, sdot of [r0|r1] . [o0|o1] (r0 o0, r1 o1) and of [r1|r0] . [o0|o1]
     /// (r1 o0, r0 o1), two lanes each; added pairwise at the group end: DOT_LANES. Two output pairs at a time (registers).
+    /// `dot` for full row pairs (`go!` takes kernels with two const parameters).
+    #[inline(always)]
+    pub unsafe fn dot2<const RP: usize, const INT4: bool>(a: *const i8, sa: *const f32, w: *const u8, sw: *const f32, k: usize, g: usize, t: &mut [[[f32; 4]; 4]; super::RPMAX]) {
+        // SAFETY: as `dot`.
+        unsafe { dot::<RP, INT4, false>(a, sa, w, sw, k, g, t) }
+    }
+
+    /// SINGLE (RP = 1): the pair holds one row twice ([r0|r0], `pack_act`); the diagonal sdot alone gives r0 o0 and
+    /// r0 o1, already in MMLA_LANES order (lanes 0, 1), with no cross products.
     #[target_feature(enable = "dotprod")]
-    pub unsafe fn dot<const RP: usize, const INT4: bool>(a: *const i8, sa: *const f32, w: *const u8, sw: *const f32, k: usize, g: usize, t: &mut [[[f32; 4]; 4]; super::RPMAX]) {
+    pub unsafe fn dot<const RP: usize, const INT4: bool, const SINGLE: bool>(a: *const i8, sa: *const f32, w: *const u8, sw: *const f32, k: usize, g: usize, t: &mut [[[f32; 4]; 4]; super::RPMAX]) {
         let ng = k / g;
         // SAFETY: as `mmla`.
         unsafe {
@@ -779,9 +867,11 @@ mod neon {
                                 let (x0, x1) = (vextq_s8::<8>(a0, a0), vextq_s8::<8>(a1, a1));
                                 for p in 0..2 {
                                     sdot!(ad[r][p], a0, wv[p].0);
-                                    sdot!(ax[r][p], x0, wv[p].0);
                                     sdot!(ad[r][p], a1, wv[p].1);
-                                    sdot!(ax[r][p], x1, wv[p].1);
+                                    if !SINGLE {
+                                        sdot!(ax[r][p], x0, wv[p].0);
+                                        sdot!(ax[r][p], x1, wv[p].1);
+                                    }
                                 }
                             }
                             kk += 16;
@@ -793,7 +883,9 @@ mod neon {
                                 let x0 = vextq_s8::<8>(a0, a0);
                                 for p in 0..2 {
                                     sdot!(ad[r][p], a0, wv[p]);
-                                    sdot!(ax[r][p], x0, wv[p]);
+                                    if !SINGLE {
+                                        sdot!(ax[r][p], x0, wv[p]);
+                                    }
                                 }
                             }
                             kk += 8;
@@ -804,14 +896,15 @@ mod neon {
                         let s = wscale(sw.add(c * 8 + 2 * pp));
                         for r in 0..RP {
                             let sc = vmulq_f32(vld1q_f32(sa.add((r * ng + c) * 4)), s);
-                            accf[r][pp] = vfmaq_f32(accf[r][pp], vcvtq_f32_s32(vpaddq_s32(ad[r][p], ax[r][p])), sc);
+                            let x = if SINGLE { ad[r][p] } else { ax[r][p] };
+                            accf[r][pp] = vfmaq_f32(accf[r][pp], vcvtq_f32_s32(vpaddq_s32(ad[r][p], x)), sc);
                         }
                     }
                 }
             }
-            // DOT_LANES -> MMLA_LANES: lanes 0, 3, 2, 1
+            // DOT_LANES -> MMLA_LANES: lanes 0, 3, 2, 1 (SINGLE: already)
             let idx = vld1q_u8([0u8, 1, 2, 3, 12, 13, 14, 15, 8, 9, 10, 11, 4, 5, 6, 7].as_ptr());
-            for r in 0..RP {
+            for r in 0..if SINGLE { 0 } else { RP } {
                 for p in 0..4 {
                     accf[r][p] = vreinterpretq_f32_u8(vqtbl1q_u8(vreinterpretq_u8_f32(accf[r][p]), idx));
                 }
@@ -1017,32 +1110,50 @@ impl QuantF {
         assert!(a.len() >= m * self.k);
         let mut out = vec![0.0; m * self.n];
         if m <= 8 {
-            // few rows (decoding): widen in registers instead of a scratch panel per call
+            // few rows (decoding): widen in registers instead of a scratch panel per call; groups of panels are
+            // independent (one task each when worth it), each into its own columns
             let (n, k) = (self.n, self.k);
-            for jp in 0..n.div_ceil(NR) {
-                let j0 = jp * NR;
-                let cols = NR.min(n - j0);
-                let mut init = [0f32; NR];
-                if let Some(b) = bias {
-                    init[..cols].copy_from_slice(&b[j0..j0 + cols]);
+            let np = n.div_ceil(NR);
+            const PG: usize = 8; // panels per task
+            let cols = crate::par::map(np.div_ceil(PG), m * n * k, |grp| {
+                let (jp0, jp1) = (grp * PG, (grp * PG + PG).min(np));
+                let w = (jp1 - jp0) * NR;
+                let mut o = vec![0f32; m * w];
+                for jp in jp0..jp1 {
+                    let j0 = jp * NR;
+                    let cols = NR.min(n - j0);
+                    let mut init = [0f32; NR];
+                    if let Some(b) = bias {
+                        init[..cols].copy_from_slice(&b[j0..j0 + cols]);
+                    }
+                    let panel = &self.q[jp * k * NR..(jp + 1) * k * NR];
+                    let sc: &[f32; NR] = self.s[j0..j0 + NR].try_into().unwrap();
+                    let mut i = 0;
+                    while i < m {
+                        let rows = 4.min(m - i);
+                        let mut tile = [[0f32; NR]; 4];
+                        let a = &a[i * k..(i + rows) * k];
+                        match rows {
+                            4 => kernel_q8::<4>(a, k, panel, sc, &init, &mut tile),
+                            3 => kernel_q8::<3>(a, k, panel, sc, &init, (&mut tile[..3]).try_into().unwrap()),
+                            2 => kernel_q8::<2>(a, k, panel, sc, &init, (&mut tile[..2]).try_into().unwrap()),
+                            _ => kernel_q8::<1>(a, k, panel, sc, &init, (&mut tile[..1]).try_into().unwrap()),
+                        }
+                        for r in 0..rows {
+                            let o0 = (i + r) * w + (jp - jp0) * NR;
+                            o[o0..o0 + NR].copy_from_slice(&tile[r]);
+                        }
+                        i += rows;
+                    }
                 }
-                let panel = &self.q[jp * k * NR..(jp + 1) * k * NR];
-                let sc: &[f32; NR] = self.s[j0..j0 + NR].try_into().unwrap();
-                let mut i = 0;
-                while i < m {
-                    let rows = 4.min(m - i);
-                    let mut tile = [[0f32; NR]; 4];
-                    let a = &a[i * k..(i + rows) * k];
-                    match rows {
-                        4 => kernel_q8::<4>(a, k, panel, sc, &init, &mut tile),
-                        3 => kernel_q8::<3>(a, k, panel, sc, &init, (&mut tile[..3]).try_into().unwrap()),
-                        2 => kernel_q8::<2>(a, k, panel, sc, &init, (&mut tile[..2]).try_into().unwrap()),
-                        _ => kernel_q8::<1>(a, k, panel, sc, &init, (&mut tile[..1]).try_into().unwrap()),
-                    }
-                    for r in 0..rows {
-                        out[(i + r) * n + j0..(i + r) * n + j0 + cols].copy_from_slice(&tile[r][..cols]);
-                    }
-                    i += rows;
+                o
+            });
+            for (grp, o) in cols.iter().enumerate() {
+                let j0 = grp * PG * NR;
+                let w = o.len() / m;
+                let c = w.min(n - j0);
+                for r in 0..m {
+                    out[r * n + j0..r * n + j0 + c].copy_from_slice(&o[r * w..r * w + c]);
                 }
             }
             return out;
@@ -1228,7 +1339,7 @@ mod tests {
                 for p in 0..m.div_ceil(2) {
                     for jp in 0..n.div_ceil(8) {
                         let mut t = [[[0f32; 4]; 4]; RPMAX];
-                        tile(path, 1, int4, &act.q[p * 2 * k..], &act.s[p * ng * 4..], &q.w[jp * pb..], &q.s[jp * ng * 8..], k, g, &mut t);
+                        tile(path, 1, 2 * p + 1 == m, int4, &act.q[p * 2 * k..], &act.s[p * ng * 4..], &q.w[jp * pb..], &q.s[jp * ng * 8..], k, g, &mut t);
                         for pp in 0..4 {
                             for (l, &(ri, oi)) in lanes.iter().enumerate() {
                                 let (r, o) = (2 * p + ri, jp * 8 + 2 * pp + oi);
@@ -1280,6 +1391,41 @@ mod tests {
                 assert!((a - want).abs() <= 2e-7 * (1.0 + want.abs()), "{v}: {a} vs {want}");
             }
         }
+    }
+
+    /// Any number of threads gives the same bits (row blocks, column groups, the few-rows paths).
+    #[cfg(feature = "std")]
+    #[test]
+    fn threads_same_bits() {
+        use crate::par::{Exec, Pool, enter};
+        let ex = std::sync::Arc::new(Exec::Pool(Pool::new(3)));
+        let mut seed = 11;
+        for &(m, n, k, g, int4) in &[(1, 2080, 512, 512, false), (4, 2048, 512, 512, false), (16, 1536, 512, 64, true), (300, 768, 256, 64, true), (77, 384, 128, 128, false)] {
+            let codes: Vec<i8> = (0..n * k).map(|_| (rnd(&mut seed) * 7.9).floor() as i8).collect();
+            let sc: Vec<f32> = (0..n * k / g).map(|_| 0.01 + rnd(&mut seed).abs() * 0.05).collect();
+            let q = Quant::new(n, k, g, int4, |j, p| codes[j * k + p], |j, c| sc[j * (k / g) + c]);
+            let qf = QuantF::new(n, k, |j, p| codes[j * k + p], |j| sc[j * (k / g)]);
+            let a: Vec<f32> = (0..m * k).map(|_| rnd(&mut seed)).collect();
+            let bias: Vec<f32> = (0..n).map(|_| rnd(&mut seed)).collect();
+            let one = (q.gemm(&a, m, Some(&bias)), qf.gemm(&a, m, Some(&bias)), gemm(&a, m, &Packed::from_rows(&qf_dense(&qf), n, k), None));
+            let three = enter(Some(&ex), || (q.gemm(&a, m, Some(&bias)), qf.gemm(&a, m, Some(&bias)), gemm(&a, m, &Packed::from_rows(&qf_dense(&qf), n, k), None)));
+            assert!(one == three, "m{m} n{n} k{k}");
+        }
+    }
+
+    #[cfg(feature = "std")]
+    fn qf_dense(q: &QuantF) -> Vec<f32> {
+        let mut s = vec![0f32; q.k * NR];
+        let mut d = vec![0f32; q.n * q.k];
+        for jp in 0..q.n.div_ceil(NR) {
+            let p = Panels::panel(q, jp, &mut s);
+            for l in 0..NR.min(q.n - jp * NR) {
+                for kk in 0..q.k {
+                    d[(jp * NR + l) * q.k + kk] = p[kk * NR + l];
+                }
+            }
+        }
+        d
     }
 
     #[test]

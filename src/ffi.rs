@@ -166,6 +166,67 @@ pub unsafe extern "C" fn tinyasr_free(m: *mut Models) {
     }
 }
 
+/// Run the bigger steps on up to `threads` threads (0, 1: only the calling one). See `Models::set_threads`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn tinyasr_set_threads(m: *mut Models, threads: u32) {
+    // SAFETY: m is null or came from tinyasr_load, and no session or file uses it at the moment.
+    #[cfg(feature = "std")]
+    if let Some(m) = unsafe { m.as_mut() } {
+        m.set_threads(threads as usize);
+    }
+    #[cfg(not(feature = "std"))]
+    let _ = (m, threads);
+}
+
+/// A task of a parallel step: the host's parallel-for calls it with `ctx` and each index.
+pub type Task = unsafe extern "C" fn(ctx: *mut core::ffi::c_void, i: usize);
+/// The host's parallel-for: call `task(ctx, i)` for every i in 0..n (any threads, any order, possibly at the same time),
+/// return when all have finished.
+pub type ParallelFor = unsafe extern "C" fn(user: *mut core::ffi::c_void, n: usize, task: Task, ctx: *mut core::ffi::c_void);
+
+/// The host's `user` pointer, handed back to its parallel-for from whichever thread runs a step.
+#[cfg(feature = "std")]
+struct User(*mut core::ffi::c_void);
+// SAFETY: the host promises its parallel-for may be called from any thread (tinyasr.h).
+#[cfg(feature = "std")]
+unsafe impl Send for User {}
+#[cfg(feature = "std")]
+unsafe impl Sync for User {}
+
+#[cfg(feature = "std")]
+impl User {
+    /// (a method: closures capture the whole wrapper, not its field)
+    fn get(&self) -> *mut core::ffi::c_void {
+        self.0
+    }
+}
+
+/// Run the bigger steps through the host's parallel-for (`threads`: how many it runs at once); NULL: one thread.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn tinyasr_set_parallel_for(m: *mut Models, f: Option<ParallelFor>, user: *mut core::ffi::c_void, threads: u32) {
+    // SAFETY: m is null or came from tinyasr_load, and no session or file uses it at the moment.
+    #[cfg(feature = "std")]
+    if let Some(m) = unsafe { m.as_mut() } {
+        let Some(f) = f else {
+            m.set_threads(1);
+            return;
+        };
+        let user = User(user);
+        m.set_parallel_for(threads as usize, move |n, task: &(dyn Fn(usize) + Sync)| {
+            unsafe extern "C" fn tramp(ctx: *mut core::ffi::c_void, i: usize) {
+                // SAFETY: ctx is the `&task` below, alive until the host's parallel-for returns.
+                let task = unsafe { &*(ctx as *const &(dyn Fn(usize) + Sync)) };
+                task(i);
+            }
+            let ctx = &task as *const &(dyn Fn(usize) + Sync) as *mut core::ffi::c_void;
+            // SAFETY: the host's function, with its pointer; it returns only when every task has run.
+            unsafe { f(user.get(), n, tramp, ctx) };
+        });
+    }
+    #[cfg(not(feature = "std"))]
+    let _ = (m, f, user, threads);
+}
+
 /// Streaming chunk of the recognizer (ms).
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn tinyasr_chunk_ms(m: *const Models) -> u32 {

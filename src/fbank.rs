@@ -116,9 +116,12 @@ impl Fbank {
     /// Frames lo..hi of the audio whose samples from `off` on are `x` (see `frame`).
     pub fn frames_at(&self, x: &[f32], off: usize, lo: usize, hi: usize) -> Vec<f32> {
         let mut out = vec![0.0; (hi - lo) * BINS];
-        for i in lo..hi {
-            self.frame(x, off, i, &mut out[(i - lo) * BINS..(i - lo + 1) * BINS]);
-        }
+        // frames are independent: blocks of 64, one task each (~10k operations a frame)
+        crate::par::chunks_mut(&mut out, 64 * BINS, (hi - lo) * 10_000, |b, o| {
+            for (j, f) in o.chunks_exact_mut(BINS).enumerate() {
+                self.frame(x, off, lo + b * 64 + j, f);
+            }
+        });
         out
     }
 

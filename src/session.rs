@@ -123,6 +123,11 @@ impl<'m> Session<'m> {
 
     /// Feed 16 kHz audio (any length); returns what changed.
     pub fn push(&mut self, x: &[f32]) -> Vec<Event> {
+        let m = self.m;
+        m.with_threads(|| self.push_here(x))
+    }
+
+    fn push_here(&mut self, x: &[f32]) -> Vec<Event> {
         if self.finished {
             return Vec::new();
         }
@@ -137,6 +142,11 @@ impl<'m> Session<'m> {
 
     /// End of audio: everything is frozen (the last `Commit`), then nothing more happens.
     pub fn finish(&mut self) -> Vec<Event> {
+        let m = self.m;
+        m.with_threads(|| self.finish_here())
+    }
+
+    fn finish_here(&mut self) -> Vec<Event> {
         if self.finished {
             return Vec::new();
         }
