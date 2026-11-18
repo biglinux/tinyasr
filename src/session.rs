@@ -204,6 +204,13 @@ impl<'m> Session<'m> {
         self.aud.drain(..k * FR as usize);
         self.vf.drain(..k.min(self.vf.len()));
         self.aud0 += k as i64 * FR;
+        // stream tokens before that too, up to a word start (the words after it come out the same)
+        let first = |t: &Token| self.h0 + t.frame as i64 * FR >= keep;
+        let word = |t: &Token| self.m.asr.pieces.get(t.id as usize).is_some_and(|p| p.starts_with('▁'));
+        if let Some(j) = self.stoks.iter().position(first).and_then(|i| (1..=i).rev().find(|&j| word(&self.stoks[j]))) {
+            self.stoks.drain(..j);
+            self.ntok = self.ntok.saturating_sub(j);
+        }
     }
 
     /// A stream in the current language over the audio from `from` on (language switch).
@@ -213,8 +220,7 @@ impl<'m> Session<'m> {
         self.stoks.clear();
         if self.pos > from {
             let x = self.audio(from, self.pos).to_vec();
-            self.stream.accept(&x);
-            self.stoks = self.stream.tokens.clone();
+            self.stoks = self.stream.accept(&x);
         }
     }
 
@@ -387,8 +393,8 @@ impl<'m> Session<'m> {
         f[..fr.len()].copy_from_slice(fr);
         self.aud.extend_from_slice(&f);
         self.pos += FR;
-        self.stream.accept(fr);
-        self.stoks.clone_from(&self.stream.tokens);
+        let new = self.stream.accept(fr);
+        self.stoks.extend(new);
         // Silero, 32 ms chunks; speech from p > 0.5 until p < 0.35
         self.vbuf.extend_from_slice(&f);
         while self.vbuf.len() >= CHUNK {

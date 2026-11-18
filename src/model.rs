@@ -15,35 +15,75 @@ use alloc::vec::Vec;
 #[cfg(not(feature = "std"))]
 use crate::compat::F32Ext;
 use crate::fbank::{BINS, Fbank};
-use crate::kernels::{Linear, Packed, Quant, Weight, dot, exp, ln, sigmoid, tanh};
+use crate::kernels::{Linear, Packed, Quant, QuantF, Weight, exp, gemm, ln, sigmoid, tanh};
 use alloc::format;
 
 // ---------------------------------------------------------------------------------------------- weights
 
-pub struct Tensors {
+pub struct Tensors<'a> {
     cfg: BTreeMap<String, i32>,
-    t: BTreeMap<String, (Vec<usize>, Data)>,
+    t: BTreeMap<String, (Vec<usize>, Data<'a>)>,
     pub pieces: Vec<String>,
 }
 
 /// A tensor as stored: f32 values, or integer codes with one scale per `group` weights of a row (TZF2).
-enum Data {
+enum Data<'a> {
     F32(Vec<f32>),
-    Int { group: usize, row: usize, scale: Vec<f32>, q: Vec<i8> }, // row = padded row length (multiple of group)
+    Int(Ints<'a>),
 }
 
-impl Data {
+/// Integer codes, still as in the file (read where needed, never unpacked whole).
+struct Ints<'a> {
+    bits: u8,
+    group: usize,
+    row: usize, // padded row length (multiple of group)
+    scale: Vec<f32>,
+    raw: &'a [u8], // rows x row codes: int8, or int4 offset by 8, two per byte (low nibble first)
+}
+
+impl Ints<'_> {
+    /// Code (r, c): int8, or int4 in -8..=7.
+    #[inline(always)]
+    fn code(&self, r: usize, c: usize) -> i8 {
+        let i = r * self.row + c;
+        if self.bits == 8 {
+            self.raw[i] as i8
+        } else {
+            let b = self.raw[i / 2];
+            (if i.is_multiple_of(2) { b & 15 } else { b >> 4 }) as i8 - 8
+        }
+    }
+
+    /// Scale of (r, c).
+    #[inline(always)]
+    fn scale(&self, r: usize, c: usize) -> f32 {
+        self.scale[r * (self.row / self.group) + c / self.group]
+    }
+
+    /// Code (r, c) times its scale: the f32 weight.
+    #[inline(always)]
+    fn value(&self, r: usize, c: usize) -> f32 {
+        self.code(r, c) as f32 * self.scale(r, c)
+    }
+
+    /// Whether every row has one scale (rows of k values, no padding): kept as int8 rows (`QuantF`, `Emb`).
+    fn per_row(&self, k: usize) -> bool {
+        self.bits == 8 && self.row == k && self.group == k
+    }
+}
+
+impl Data<'_> {
     /// f32 values (rows x k, padding dropped).
     fn f32(self, dims: &[usize]) -> Vec<f32> {
         match self {
             Data::F32(v) => v,
-            Data::Int { group, row, scale, q } => {
+            Data::Int(q) => {
                 let n = dims[0];
                 let k: usize = dims[1..].iter().product();
                 let mut out = Vec::with_capacity(n * k);
                 for r in 0..n {
                     for c in 0..k {
-                        out.push(q[r * row + c] as f32 * scale[r * (row / group) + c / group]);
+                        out.push(q.value(r, c));
                     }
                 }
                 out
@@ -115,10 +155,10 @@ impl<'a> Rd<'a> {
     }
 }
 
-impl Tensors {
+impl<'a> Tensors<'a> {
     /// The `.tzf` file written by `export_tzf.py` (TZF1: f32) or `export_tzf2.py` (TZF2: integer weights). Every size
     /// is checked against the file, so a corrupted file is an error here, never a crash.
-    pub fn parse(b: &[u8]) -> R<Tensors> {
+    pub fn parse(b: &'a [u8]) -> R<Tensors<'a>> {
         let mut r = Rd { b, p: 0 };
         let v2 = match r.take(4)? {
             b"TZF1" => false,
@@ -153,9 +193,9 @@ impl Tensors {
             let rows = dims[0];
             let row = (n / rows).div_ceil(group).checked_mul(group).ok_or(BAD)?;
             let total = rows.checked_mul(row).ok_or(BAD)?;
-            let q: Vec<i8> = match bits {
-                8 => r.take(total)?.iter().map(|&c| c as i8).collect(),
-                4 => r.take(total.div_ceil(2))?.iter().flat_map(|&c| [(c & 15) as i8 - 8, (c >> 4) as i8 - 8]).take(total).collect(),
+            let raw = match bits {
+                8 => r.take(total)?,
+                4 => r.take(total.div_ceil(2))?,
                 _ => return Err("model file: unsupported integer width"),
             };
             r.align4();
@@ -165,7 +205,7 @@ impl Tensors {
             } else {
                 r.take(ns.checked_mul(4).ok_or(BAD)?)?.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect()
             };
-            t.insert(k, (dims, Data::Int { group, row, scale, q }));
+            t.insert(k, (dims, Data::Int(Ints { bits, group, row, scale, raw })));
         }
         let pieces = (0..r.u32()?).map(|_| r.str()).collect::<R<Vec<_>>>()?;
         Ok(Tensors { cfg, t, pieces })
@@ -199,6 +239,11 @@ impl Tensors {
         Ok(self.vec(k, 1)?[0])
     }
 
+    /// The tensor itself (f32 or integer codes), removed.
+    fn take(&mut self, k: &str) -> R<(Vec<usize>, Data<'a>)> {
+        self.t.remove(k).ok_or(MISSING)
+    }
+
     fn has(&self, k: &str) -> bool {
         self.t.contains_key(k)
     }
@@ -223,7 +268,10 @@ impl Tensors {
             None => None,
         };
         let w = match data {
-            Data::Int { group, row, scale, q } if row == kk => Weight::Int(Quant::new(rows, kk, group, scale, q)),
+            // integer weights stay integer (int4 packed two per byte) when the groups tile the row in steps of 16
+            Data::Int(q) if q.row == kk && q.group % 16 == 0 => {
+                Weight::Int(Quant::new(rows, kk, q.group, q.bits == 4, |j, p| q.code(j, p), |j, c| q.scale(j, c * q.group)))
+            }
             data => Weight::F32(Packed::from_rows(&data.f32(&d), rows, kk)),
         };
         Ok(Linear { w, b })
@@ -239,11 +287,22 @@ fn softplus(x: f32) -> f32 {
 }
 
 fn swoosh_l(x: &mut [f32]) {
-    x.iter_mut().for_each(|v| *v = softplus(*v - 4.0) - 0.08 * *v - 0.035);
+    swoosh(x, 4.0, 0.035);
 }
 
 fn swoosh_r(x: &mut [f32]) {
-    x.iter_mut().for_each(|v| *v = softplus(*v - 1.0) - 0.08 * *v - 0.313_261_7);
+    swoosh(x, 1.0, 0.313_261_7);
+}
+
+/// softplus(v - shift) - 0.08 v - c, in place.
+fn swoosh(x: &mut [f32], shift: f32, c: f32) {
+    #[cfg(target_arch = "aarch64")]
+    let x = {
+        let n = x.len() / 4 * 4;
+        crate::kernels::swoosh4(&mut x[..n], shift, c);
+        &mut x[n..]
+    };
+    x.iter_mut().for_each(|v| *v = softplus(*v - shift) - 0.08 * *v - c);
 }
 
 /// BiasNorm: x * exp(log_scale) / rms(x - bias), per row.
@@ -301,9 +360,15 @@ struct FeedForward {
 
 impl FeedForward {
     fn apply(&self, x: &[f32], t: usize) -> Vec<f32> {
-        let mut h = self.inp.apply(x, t);
-        swoosh_l(&mut h);
-        self.out.apply(&h, t)
+        let k = x.len() / t;
+        let mut out = Vec::with_capacity(t * self.out.n());
+        for r0 in (0..t).step_by(RB) {
+            let r = RB.min(t - r0);
+            let mut h = self.inp.apply(&x[r0 * k..(r0 + r) * k], r);
+            swoosh_l(&mut h);
+            out.extend_from_slice(&self.out.apply(&h, r));
+        }
+        out
     }
 }
 
@@ -351,18 +416,37 @@ impl AttnWeights {
         }
         let p = self.pos.apply(&pe, np);
         let mut out = vec![0.0; h * t * tk];
+        let mut qh = vec![0.0; t * qd];
+        let mut kh = vec![0.0; tk * qd];
+        let mut pt = vec![0.0; pd * np];
         for hh in 0..h {
+            // content scores: Q_h (t x qd) K_h^T, as one product
             for i in 0..t {
-                let q = &y[i * w + hh * qd..i * w + (hh + 1) * qd];
-                let pq = &y[i * w + 2 * qdim + hh * pd..i * w + 2 * qdim + (hh + 1) * pd];
+                qh[i * qd..(i + 1) * qd].copy_from_slice(&y[i * w + hh * qd..i * w + (hh + 1) * qd]);
+            }
+            for j in 0..tk {
+                kh[j * qd..(j + 1) * qd].copy_from_slice(&k[j * qdim + hh * qd..j * qdim + (hh + 1) * qd]);
+            }
+            let sc = gemm(&qh, t, &Packed::from_rows(&kh, tk, qd), None);
+            // position scores: query i, key j sees relative position row n = t - 1 - i + j; with P_h transposed
+            // (pd x np) each query adds pd contiguous runs
+            for n in 0..np {
+                for c in 0..pd {
+                    pt[c * np + n] = p[n * h * pd + hh * pd + c];
+                }
+            }
+            for i in 0..t {
                 let row = &mut out[(hh * t + i) * tk..(hh * t + i + 1) * tk];
-                for j in 0..tk {
-                    row[j] = if masked.get(j).copied().unwrap_or(false) {
-                        -1000.0
-                    } else {
-                        let n = t - 1 - i + j;
-                        dot(q, &k[j * qdim + hh * qd..j * qdim + (hh + 1) * qd]) + dot(pq, &p[n * h * pd + hh * pd..n * h * pd + (hh + 1) * pd])
-                    };
+                row.copy_from_slice(&sc[i * tk..(i + 1) * tk]);
+                let n0 = t - 1 - i;
+                for c in 0..pd {
+                    let pq = y[i * w + 2 * qdim + hh * pd + c];
+                    row.iter_mut().zip(&pt[c * np + n0..c * np + n0 + tk]).for_each(|(r, v)| *r += pq * v);
+                }
+                for (r, &m) in row.iter_mut().zip(masked) {
+                    if m {
+                        *r = -1000.0;
+                    }
                 }
                 let m = row.iter().cloned().fold(f32::MIN, f32::max);
                 let mut s = 0.0;
@@ -370,7 +454,8 @@ impl AttnWeights {
                     *v = exp(*v - m);
                     s += *v;
                 });
-                row.iter_mut().for_each(|v| *v /= s);
+                let inv = 1.0 / s;
+                row.iter_mut().for_each(|v| *v *= inv);
             }
         }
         out
@@ -382,6 +467,35 @@ impl AttnWeights {
 fn axpy(y: &mut [f32], w: &[f32], x: &[f32]) {
     for ((y, w), x) in y.iter_mut().zip(w).zip(x) {
         *y += w * x;
+    }
+}
+
+/// Rows processed at a time by the row-wise parts of a layer (feed-forward, front end): their intermediate buffers
+/// stay small (cache-resident, and under the size allocators recycle instead of mapping fresh pages each call).
+const RB: usize = 64;
+
+/// out[c] = init[c] + sum over taps of w_tap[c] * x_tap[c] (in tap order), for every channel; channels in blocks of
+/// 16 held in registers across all taps (the same sums, in the same order, as one axpy per tap).
+#[inline(always)]
+fn taps<'a>(out: &mut [f32], init: &[f32], taps: impl Iterator<Item = (&'a [f32], &'a [f32])> + Clone) {
+    let d = out.len();
+    let mut c0 = 0;
+    while c0 + 16 <= d {
+        let mut acc: [f32; 16] = init[c0..c0 + 16].try_into().unwrap();
+        for (w, x) in taps.clone() {
+            let (w, x) = (&w[c0..c0 + 16], &x[c0..c0 + 16]);
+            for l in 0..16 {
+                acc[l] += w[l] * x[l];
+            }
+        }
+        out[c0..c0 + 16].copy_from_slice(&acc);
+        c0 += 16;
+    }
+    if c0 < d {
+        out[c0..].copy_from_slice(&init[c0..]);
+        for (w, x) in taps {
+            axpy(&mut out[c0..], &w[c0..], &x[c0..]);
+        }
     }
 }
 
@@ -400,16 +514,17 @@ fn transpose(x: &[f32], rows: usize, cols: usize) -> Vec<f32> {
 fn weighted(wts: &[f32], heads: usize, t: usize, tk: usize, v: &[f32], d: usize) -> Vec<f32> {
     let vd = v.len() / tk;
     let mut out = vec![0.0; t * heads * d];
+    let mut vt = vec![0.0; d * tk];
     for hh in 0..heads {
-        for i in 0..t {
-            let o = &mut out[i * heads * d + hh * d..i * heads * d + (hh + 1) * d];
-            let w = &wts[(hh * t + i) * tk..(hh * t + i + 1) * tk];
-            for (j, &a) in w.iter().enumerate() {
-                if a != 0.0 {
-                    let vr = &v[j * vd + hh * d..j * vd + (hh + 1) * d];
-                    o.iter_mut().zip(vr).for_each(|(x, y)| *x += a * y);
-                }
+        // values of this head, transposed (d x tk): the right-hand matrix of W_h (t x tk) V_h
+        for j in 0..tk {
+            for c in 0..d {
+                vt[c * tk + j] = v[j * vd + hh * d + c];
             }
+        }
+        let o = gemm(&wts[hh * t * tk..(hh + 1) * t * tk], t, &Packed::from_rows(&vt, d, tk), None);
+        for i in 0..t {
+            out[i * heads * d + hh * d..i * heads * d + (hh + 1) * d].copy_from_slice(&o[i * d..(i + 1) * d]);
         }
     }
     out
@@ -497,18 +612,10 @@ impl Conv {
         let mut b = vec![0.0; d];
         for i in 0..t {
             let a = &mut y[i * d..(i + 1) * d];
-            a.copy_from_slice(&self.causal_b);
-            for u in 0..half {
-                axpy(a, &self.causal_w[u * d..(u + 1) * d], &pad[(i + u) * d..(i + u + 1) * d]);
-            }
+            taps(a, &self.causal_b, (0..half).map(|u| (&self.causal_w[u * d..(u + 1) * d], &pad[(i + u) * d..(i + u + 1) * d])));
             // chunkwise part: centred kernel inside this chunk, zero outside, edge-scaled
-            b.copy_from_slice(&self.chunk_b);
-            for u in 0..k {
-                let s = i as isize + u as isize - lp as isize;
-                if s >= 0 && (s as usize) < t {
-                    axpy(&mut b, &self.chunk_w[u * d..(u + 1) * d], &g[s as usize * d..(s as usize + 1) * d]);
-                }
-            }
+            let (u0, u1) = (lp.saturating_sub(i), k.min(t + lp - i));
+            taps(&mut b, &self.chunk_b, (u0..u1).map(|u| (&self.chunk_w[u * d..(u + 1) * d], &g[(i + u - lp) * d..(i + u - lp + 1) * d])));
             let (l, r) = if t < k { (Some(i), Some(k - t + i)) } else { ((i < k).then_some(i), (i >= t - k).then(|| i - (t - k))) };
             let row = |j: Option<usize>, half: usize| j.map(|j| &self.scale[(half * k + j) * d..(half * k + j + 1) * d]);
             let (le, re) = (row(l, 0), row(r, 1));
@@ -666,23 +773,30 @@ const C3: usize = 128;
 fn conv3(x: &[f32], t: usize, f: usize, cin: usize, lin: &Linear, st: usize, sf: usize, pf: usize) -> (Vec<f32>, usize, usize) {
     let to = (t - 3) / st + 1;
     let fo = (f + 2 * pf - 3) / sf + 1;
-    let mut col = vec![0.0; to * fo * 9 * cin];
-    for i in 0..to {
-        for j in 0..fo {
-            let row = &mut col[(i * fo + j) * 9 * cin..(i * fo + j + 1) * 9 * cin];
-            for ci in 0..cin {
-                for a in 0..3 {
-                    for b in 0..3 {
-                        let (tt, ff) = (i * st + a, (j * sf + b) as isize - pf as isize);
-                        // PyTorch weight layout (cout, cin, 3, 3) -> column index ci*9 + a*3 + b
-                        row[ci * 9 + a * 3 + b] = if ff >= 0 && (ff as usize) < f { x[(tt * f + ff as usize) * cin + ci] } else { 0.0 };
+    // output time rows per block: about 256 Ki values of im2col at a time
+    let tb = ((1 << 18) / (fo * 9 * cin)).max(1);
+    let mut y = Vec::with_capacity(to * fo * lin.n());
+    let mut col = vec![0.0; tb.min(to) * fo * 9 * cin];
+    for i0 in (0..to).step_by(tb) {
+        let nb = tb.min(to - i0);
+        for i in i0..i0 + nb {
+            for j in 0..fo {
+                let row = &mut col[((i - i0) * fo + j) * 9 * cin..((i - i0) * fo + j + 1) * 9 * cin];
+                for ci in 0..cin {
+                    for a in 0..3 {
+                        for b in 0..3 {
+                            let (tt, ff) = (i * st + a, (j * sf + b) as isize - pf as isize);
+                            // PyTorch weight layout (cout, cin, 3, 3) -> column index ci*9 + a*3 + b
+                            row[ci * 9 + a * 3 + b] = if ff >= 0 && (ff as usize) < f { x[(tt * f + ff as usize) * cin + ci] } else { 0.0 };
+                        }
                     }
                 }
             }
         }
+        let mut yb = lin.apply(&col[..nb * fo * 9 * cin], nb * fo);
+        swoosh_r(&mut yb);
+        y.extend_from_slice(&yb);
     }
-    let mut y = lin.apply(&col, to * fo);
-    swoosh_r(&mut y);
     (y, to, fo)
 }
 
@@ -700,26 +814,28 @@ impl Embed {
     fn convnext(&self, rows: &[f32], t_in: usize) -> Vec<f32> {
         let t = t_in - 6;
         let row = FW * C3;
-        let mut y = vec![0.0; t * row];
-        for i in 0..t {
-            for f in 0..FW {
-                let a = &mut y[i * row + f * C3..i * row + (f + 1) * C3];
-                a.copy_from_slice(&self.dw_b);
-                for dt in 0..7 {
-                    for df in 0..7 {
-                        let ff = f as isize + df as isize - 3;
-                        if ff >= 0 && (ff as usize) < FW {
-                            let x = &rows[(i + dt) * row + ff as usize * C3..(i + dt) * row + (ff as usize + 1) * C3];
-                            axpy(a, &self.dw_w[(dt * 7 + df) * C3..(dt * 7 + df + 1) * C3], x);
-                        }
-                    }
+        let tb = (RB / FW).max(1); // time rows per block (x 19 frequency rows each)
+        let mut z = Vec::with_capacity(t * row);
+        let mut y = vec![0.0; tb.min(t) * row];
+        for i0 in (0..t).step_by(tb) {
+            let nb = tb.min(t - i0);
+            for i in i0..i0 + nb {
+                for f in 0..FW {
+                    let a = &mut y[(i - i0) * row + f * C3..(i - i0) * row + (f + 1) * C3];
+                    let (f0, f1) = (3usize.saturating_sub(f), 7.min(FW + 3 - f));
+                    let tap = |dt: usize, df: usize| {
+                        let ff = f + df - 3;
+                        (&self.dw_w[(dt * 7 + df) * C3..(dt * 7 + df + 1) * C3], &rows[(i + dt) * row + ff * C3..(i + dt) * row + (ff + 1) * C3])
+                    };
+                    taps(a, &self.dw_b, (0..7).flat_map(|dt| (f0..f1).map(move |df| (dt, df))).map(|(dt, df)| tap(dt, df)));
                 }
             }
+            let mut h = self.pw1.apply(&y[..nb * row], nb * FW);
+            swoosh_l(&mut h);
+            let mut zb = self.pw2.apply(&h, nb * FW);
+            add(&mut zb, &rows[(3 + i0) * row..(3 + i0 + nb) * row]);
+            z.extend_from_slice(&zb);
         }
-        let mut h = self.pw1.apply(&y, t * FW);
-        swoosh_l(&mut h);
-        let mut z = self.pw2.apply(&h, t * FW);
-        add(&mut z, &rows[3 * row..(3 + t) * row]);
         z
     }
 
@@ -845,6 +961,23 @@ impl Lstm {
     }
 }
 
+/// The decoder's token embeddings (vocabulary x d): f32, or int8 rows with one scale each (as in the file).
+enum Emb {
+    F32(Vec<f32>, usize),
+    I8 { q: Vec<i8>, s: Vec<f32>, d: usize },
+}
+
+impl Emb {
+    /// The embedding of token `id` (f32).
+    fn row(&self, id: u32) -> Vec<f32> {
+        let id = id as usize;
+        match self {
+            Emb::F32(v, d) => v[id * d..(id + 1) * d].to_vec(),
+            Emb::I8 { q, s, d } => q[id * d..(id + 1) * d].iter().map(|&c| c as f32 * s[id]).collect(),
+        }
+    }
+}
+
 /// Most zero-duration tokens on one frame in TDT greedy before it is forced on (the server scorer's max_sym).
 const TDT_MAX_SYM: usize = 5;
 
@@ -863,7 +996,7 @@ pub struct Model {
     stacks: Vec<Stack>,
     out_down: Vec<f32>,
     lang_vec: Vec<Vec<f32>>,
-    dec_emb: Vec<f32>,
+    dec_emb: Emb,
     dec_conv: Vec<f32>, // dim x 4 x context (groups of 4 channels)
     dec_dim: usize,
     context: usize,
@@ -998,19 +1131,21 @@ impl Model {
         let enc_dim = stacks.iter().map(|s| s.dim).max().unwrap_or(d0); // the full-dim output (`encode`)
         let out_down = softmax(&w.vec_in("encoder.downsample_output.bias", 1, 64)?);
         // front end: im2col weights stay PyTorch (cout, cin*9); `out` takes (f, c) instead of (c, f)
-        let (od, ow) = w.get("encoder_embed.out.weight")?;
-        if od.first() != Some(&d0) || ow.len() != d0 * FW * C3 {
+        let (od, odata) = w.take("encoder_embed.out.weight")?;
+        let ok = FW * C3;
+        if od.first() != Some(&d0) || od[1..].iter().product::<usize>() != ok {
             return Err(SHAPE);
         }
-        let ok = FW * C3;
-        let mut ow2 = vec![0.0; ow.len()];
-        for n in 0..d0 {
-            for c in 0..C3 {
-                for f in 0..FW {
-                    ow2[n * ok + f * C3 + c] = ow[n * ok + c * FW + f];
-                }
+        // column f * C3 + c reads PyTorch's c * FW + f
+        let perm = |p: usize| (p % C3) * FW + p / C3;
+        let out_w = match odata {
+            Data::Int(q) if q.per_row(ok) => Weight::I8(QuantF::new(d0, ok, |j, p| q.code(j, perm(p)), |j| q.scale(j, 0))),
+            data => {
+                let ow = data.f32(&od);
+                let ow2: Vec<f32> = (0..d0 * ok).map(|i| ow[(i / ok) * ok + perm(i % ok)]).collect();
+                Weight::F32(Packed::from_rows(&ow2, d0, ok))
             }
-        }
+        };
         let pw1 = w.linear("encoder_embed.convnext.pointwise_conv1", true, None, C3)?;
         let embed = Embed {
             c0: w.linear("encoder_embed.conv.0", true, Some(8), 9)?,
@@ -1020,7 +1155,7 @@ impl Model {
             dw_b: w.vec("encoder_embed.convnext.depthwise_conv.bias", C3)?,
             pw2: w.linear("encoder_embed.convnext.pointwise_conv2", true, Some(C3), pw1.n())?,
             pw1,
-            out: Linear { w: Weight::F32(Packed::from_rows(&ow2, d0, ok)), b: Some(w.vec("encoder_embed.out.bias", d0)?) },
+            out: Linear { w: out_w, b: Some(w.vec("encoder_embed.out.bias", d0)?) },
             norm: BiasNorm::load(&mut w, "encoder_embed.out_norm", d0)?,
         };
         use crate::Lang;
@@ -1046,22 +1181,35 @@ impl Model {
         }
         let lang_vec = (0..n).map(|k| le[k * d0..(k + 1) * d0].to_vec()).collect();
         // decoder: embedding (vocabulary x dec_dim, dec_dim in groups of 4) and its convolution over `context` tokens
-        let (dd, dec_emb) = w.get("decoder.embedding.weight")?;
+        let (dd, demb) = w.take("decoder.embedding.weight")?;
         let dec_dim: usize = dd.get(1..).map_or(0, |r| r.iter().product());
         if dd.len() < 2 || dec_dim == 0 || dec_dim % 4 != 0 || dd[0] == 0 {
             return Err(SHAPE);
         }
+        let dec_emb = match demb {
+            Data::Int(q) if q.per_row(dec_dim) => Emb::I8 {
+                q: (0..dd[0] * dec_dim).map(|i| q.code(i / dec_dim, i % dec_dim)).collect(),
+                s: (0..dd[0]).map(|r| q.scale(r, 0)).collect(),
+                d: dec_dim,
+            },
+            data => Emb::F32(data.f32(&dd), dec_dim),
+        };
         let dec_conv = w.vec("decoder.conv.weight", dec_dim * 4 * context)?;
         // joiner: every id a language can emit (< shared + n * lang_size) has an output row and a decoder embedding
         let shared = w.c("shared", 0, 1 << 16)?;
         let size = w.c("lang_size", 0, 1 << 16)?;
         let enc = w.linear("joiner.encoder_proj", true, None, enc_dim)?;
         let jdim = enc.n();
-        let (jd, jw) = w.get("joiner.output_linear.weight")?;
+        let (jd, jdata) = w.take("joiner.output_linear.weight")?;
         let vocab = jd.first().copied().unwrap_or(0);
-        if vocab == 0 || jw.len() != vocab * jdim || shared + size == 0 || shared + n * size > vocab || vocab > dd[0] {
+        if vocab == 0 || jd[1..].iter().product::<usize>() != jdim || shared + size == 0 || shared + n * size > vocab || vocab > dd[0] {
             return Err(SHAPE);
         }
+        // int8 rows stay int8 (multiplied in f32: `QuantF`)
+        let jw = match jdata {
+            Data::Int(q) if q.per_row(jdim) => Ok(q),
+            data => Err(data.f32(&jd)),
+        };
         let jb = w.vec("joiner.output_linear.bias", vocab)?;
         let (shared, size) = (shared as u32, size as u32);
         let out = (0..n as u32)
@@ -1072,12 +1220,18 @@ impl Model {
                 if k != 0 {
                     ids.extend(shared + k * size..shared + (k + 1) * size);
                 }
-                let mut rows = Vec::with_capacity(ids.len() * jdim);
-                for &i in &ids {
-                    rows.extend_from_slice(&jw[i as usize * jdim..(i as usize + 1) * jdim]);
-                }
+                let lw = match &jw {
+                    Ok(q) => Weight::I8(QuantF::new(ids.len(), jdim, |j, p| q.code(ids[j] as usize, p), |j| q.scale(ids[j] as usize, 0))),
+                    Err(jw) => {
+                        let mut rows = Vec::with_capacity(ids.len() * jdim);
+                        for &i in &ids {
+                            rows.extend_from_slice(&jw[i as usize * jdim..(i as usize + 1) * jdim]);
+                        }
+                        Weight::F32(Packed::from_rows(&rows, ids.len(), jdim))
+                    }
+                };
                 let b = ids.iter().map(|&i| jb[i as usize]).collect();
-                (Linear { w: Weight::F32(Packed::from_rows(&rows, ids.len(), jdim)), b: Some(b) }, ids)
+                (Linear { w: lw, b: Some(b) }, ids)
             })
             .collect::<Vec<_>>();
         if out.iter().any(|(_, ids)| ids.first() != Some(&0)) {
@@ -1209,7 +1363,7 @@ impl Model {
             let mut x = Vec::with_capacity(n * d);
             let mut hp = Vec::with_capacity(n * hn);
             for (dec, &id) in decs.iter().zip(ids) {
-                x.extend_from_slice(&self.dec_emb[id as usize * d..(id as usize + 1) * d]);
+                x.extend_from_slice(&self.dec_emb.row(id));
                 hp.extend_from_slice(&dec.h);
             }
             let mut g = l.ih.apply(&x, n);
@@ -1249,8 +1403,7 @@ impl Model {
     fn advance(&self, dec: &mut Decoding, id: u32) {
         dec.ctx.push(id);
         if let Some(l) = &self.lstm {
-            let d = self.dec_dim;
-            l.step(&self.dec_emb[id as usize * d..(id as usize + 1) * d], &mut dec.h, &mut dec.c);
+            l.step(&self.dec_emb.row(id), &mut dec.h, &mut dec.c);
         }
         dec.out = self.decoder_out(&dec.ctx, &dec.h);
     }
@@ -1261,12 +1414,13 @@ impl Model {
         let d = self.dec_dim;
         let c = self.context;
         let mut y = vec![0.0; d];
+        let rows: Vec<Vec<f32>> = ctx[ctx.len() - c..].iter().map(|&tok| self.dec_emb.row(tok)).collect();
         for o in 0..d {
             let g = o / 4;
             let mut a = 0.0;
             for i in 0..4 {
-                for (k, &tok) in ctx[ctx.len() - c..].iter().enumerate() {
-                    a += self.dec_conv[(o * 4 + i) * c + k] * self.dec_emb[tok as usize * d + g * 4 + i];
+                for (k, row) in rows.iter().enumerate() {
+                    a += self.dec_conv[(o * 4 + i) * c + k] * row[g * 4 + i];
                 }
             }
             y[o] = a.max(0.0);
@@ -1536,10 +1690,9 @@ impl Model {
             ctx.extend(&ids);
             let mut y = self.decoder_y(&ctx);
             if let Some(l) = &self.lstm {  // hybrid decoder: + the LSTM output after [blank] + the text (eou_head.py)
-                let dd = self.dec_dim;
                 let (mut hs, mut cs) = (vec![0.0; l.hidden], vec![0.0; l.hidden]);
                 for &i in [0].iter().chain(&ids) {
-                    l.step(&self.dec_emb[i as usize * dd..(i as usize + 1) * dd], &mut hs, &mut cs);
+                    l.step(&self.dec_emb.row(i), &mut hs, &mut cs);
                 }
                 let p = l.proj.apply(&hs, 1);
                 y.iter_mut().zip(&p).for_each(|(a, b)| *a += l.gate * b);
@@ -1576,7 +1729,7 @@ impl Decoding {
         let n = m.lstm.as_ref().map_or(0, |l| l.hidden);
         let (mut h, mut c) = (vec![0.0; n], vec![0.0; n]);
         if let Some(l) = &m.lstm {  // training runs the LSTM over [blank] + labels: the start state has seen blank
-            l.step(&m.dec_emb[..m.dec_dim], &mut h, &mut c);
+            l.step(&m.dec_emb.row(0), &mut h, &mut c);
         }
         let out = m.decoder_out(&ctx, &h);
         Decoding { ctx, out, h, c, skip: 0, run: 0 }
@@ -1591,15 +1744,16 @@ pub struct Stream<'m> {
     m: &'m Model,
     lang: usize,
     fb: Fbank,
-    audio: Vec<f32>,
-    feats: Vec<f32>, // frames computed so far
-    nfeat: usize,
+    audio: Vec<f32>, // samples from `audio0` on (what the next feature frames read)
+    audio0: usize,
+    feats: Vec<f32>, // feature frames from `feat0` on (what the next chunks read)
+    feat0: usize,
+    nfeat: usize, // feature frames computed so far
     chunks: usize,
     embed_cache: Vec<f32>, // 3 x 19 x 128
     states: Vec<Vec<LayerState>>,
     processed: usize, // 50 Hz frames through the encoder
     dec: Decoding,
-    pub tokens: Vec<Token>,
     finished: bool,
     /// Encoder output of every chunk so far (frames x 512), kept when `keep_enc` is set (tests).
     pub keep_enc: bool,
@@ -1631,14 +1785,15 @@ impl<'m> Stream<'m> {
             lang,
             fb: Fbank::new(),
             audio: Vec::new(),
+            audio0: 0,
             feats: Vec::new(),
+            feat0: 0,
             nfeat: 0,
             chunks: 0,
             embed_cache: vec![0.0; 3 * FW * C3],
             states,
             processed: 0,
             dec: Decoding::new(m),
-            tokens: Vec::new(),
             finished: false,
             keep_enc: false,
             enc: Vec::new(),
@@ -1652,21 +1807,32 @@ impl<'m> Stream<'m> {
     /// Feed 16 kHz audio; returns the tokens decoded from the chunks it completed.
     pub fn accept(&mut self, x: &[f32]) -> Vec<Token> {
         self.audio.extend_from_slice(x);
-        let ready = if self.finished { Fbank::num_frames(self.audio.len()) } else { Fbank::num_ready(self.audio.len()) };
+        let n = self.audio0 + self.audio.len();
+        let ready = if self.finished { Fbank::num_frames(n) } else { Fbank::num_ready(n) };
         if ready > self.nfeat {
-            let f = self.fb.frames(&self.audio, self.nfeat, ready);
+            let f = self.fb.frames_at(&self.audio, self.audio0, self.nfeat, ready);
             self.feats.extend_from_slice(&f);
             self.nfeat = ready;
         }
         let mut out = Vec::new();
         let (win, step) = (self.window(), 2 * self.m.chunk);
         while self.chunks * step + win <= self.nfeat {
-            let s = self.chunks * step;
+            let s = self.chunks * step - self.feat0;
             let t = self.chunk(&self.feats[s * BINS..(s + win) * BINS].to_vec());
             out.extend(t);
             self.chunks += 1;
         }
-        self.tokens.extend_from_slice(&out);
+        // keep only what the next frames and chunks read: memory stays flat however long the stream runs
+        let f0 = self.chunks * step;
+        if f0 > self.feat0 {
+            self.feats.drain(..(f0 - self.feat0) * BINS);
+            self.feat0 = f0;
+        }
+        let a0 = (self.nfeat * 160).saturating_sub(120).max(self.audio0);
+        if self.nfeat > 0 && a0 > self.audio0 {
+            self.audio.drain(..a0 - self.audio0);
+            self.audio0 = a0;
+        }
         out
     }
 

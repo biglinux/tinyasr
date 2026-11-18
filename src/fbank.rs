@@ -73,9 +73,10 @@ impl Fbank {
         if n < 280 { 0 } else { (n - 280) / SHIFT + 1 }
     }
 
-    /// Frame `i` of `x` (n = x.len() samples so far; `finished` mirrors past the end as Kaldi does).
-    pub fn frame(&self, x: &[f32], i: usize, out: &mut [f32]) {
-        let n = x.len() as isize;
+    /// Frame `i` of the audio whose samples from `off` on are `x` (n = off + x.len() samples so far; mirrored past
+    /// either end as Kaldi does). Reads samples from 160 i - 120 on (frame 0: from 0).
+    pub fn frame(&self, x: &[f32], off: usize, i: usize, out: &mut [f32]) {
+        let n = (off + x.len()) as isize;
         let start = (i * SHIFT) as isize + (SHIFT / 2) as isize - (LEN / 2) as isize;
         let mut w = [0f32; LEN];
         for (j, v) in w.iter_mut().enumerate() {
@@ -83,7 +84,7 @@ impl Fbank {
             while s < 0 || s >= n {
                 s = if s < 0 { -s - 1 } else { 2 * n - 1 - s };
             }
-            *v = x[s as usize];
+            *v = x[s as usize - off];
         }
         let mean = w.iter().sum::<f32>() / LEN as f32;
         w.iter_mut().for_each(|v| *v -= mean);
@@ -109,9 +110,14 @@ impl Fbank {
 
     /// Frames lo..hi of `x` (BINS each).
     pub fn frames(&self, x: &[f32], lo: usize, hi: usize) -> Vec<f32> {
+        self.frames_at(x, 0, lo, hi)
+    }
+
+    /// Frames lo..hi of the audio whose samples from `off` on are `x` (see `frame`).
+    pub fn frames_at(&self, x: &[f32], off: usize, lo: usize, hi: usize) -> Vec<f32> {
         let mut out = vec![0.0; (hi - lo) * BINS];
         for i in lo..hi {
-            self.frame(x, i, &mut out[(i - lo) * BINS..(i - lo + 1) * BINS]);
+            self.frame(x, off, i, &mut out[(i - lo) * BINS..(i - lo + 1) * BINS]);
         }
         out
     }

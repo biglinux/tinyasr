@@ -9,7 +9,7 @@ Demo at: https://dkaraush.github.io/tinyasr/web/
 - Punctuation, capitalization and word timestamps.
 - Live streaming with re-decodes of the open sentence, or a full-context pass over a finished recording.
 - Built-in Silero VAD and end-of-turn head: knows when the speaker has finished a sentence.
-- SIMD on ARM NEON (`dotprod`), x86_64 SSE, and WASM.
+- SIMD on ARM (`i8mm`, `dotprod` or plain NEON, picked at runtime), x86_64 SSE, and WASM; int4 weights stay int4 in memory (~46 MB loaded for a 38 MB model).
 - Zero dependencies.
 
 ### Building (Native)
