@@ -9,7 +9,7 @@ Demo at: https://dkaraush.github.io/tinyasr/web/
 - Punctuation, capitalization and word timestamps.
 - Live streaming with re-decodes of the open sentence, or a full-context pass over a finished recording.
 - Built-in Silero VAD and end-of-turn head.
-- SIMD on ARM (`i8mm`, `dotprod` or plain NEON, picked at runtime), x86_64 (the integer kernels of ARM with AVX-512 VNNI, AVX-VNNI or AVX2, picked at runtime; `TINYASR_INT8=0` or no AVX2: f32 with AVX-512, AVX2 or SSE2), and WASM (SIMD128; relaxed SIMD); int4 weights stay int4 in memory (~46 MB loaded for a 38 MB model).
+- SIMD on ARM (`i8mm`, `dotprod`, plain NEON), x86_64 (AVX-512 VNNI, AVX-VNNI or AVX2), and WASM (SIMD128; relaxed SIMD); int4 weights stay int4 in memory (~46 MB loaded for a 38 MB model).
 - Multi-threading supported.
 - Zero dependencies.
 
@@ -44,6 +44,6 @@ WER %, second pass (beam 4) / streaming (greedy)
 
 ### License
 
-tinyasr, including the model files in `models/`, is licensed under the [GNU General Public License v3.0 or later](LICENSE).
+tinyasr, including the model files in `models/`, is licensed under the [GNU General Public License v3.0 or later](LICENSE). If you distribute the app with this library or models, either for non-commercial or commercial use, please contribute to open source and release source code of your app.
 
 Models were trained primarily on [YODAS v3](https://huggingface.co/datasets/espnet/yodas3) (ESPnet, [CC BY 3.0](https://creativecommons.org/licenses/by/3.0/)), a corpus of Creative Commons-licensed YouTube audio; see the dataset card for per-source attribution. Voice activity detection uses [Silero VAD](https://github.com/snakers4/silero-vad) (MIT).
