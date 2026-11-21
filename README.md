@@ -8,8 +8,8 @@ Demo at: https://dkaraush.github.io/tinyasr/web/
 - RNN-T and TDT transducers, stateless or LSTM-hybrid decoders; greedy or beam search (width 4 by default).
 - Punctuation, capitalization and word timestamps.
 - Live streaming with re-decodes of the open sentence, or a full-context pass over a finished recording.
-- Built-in Silero VAD and end-of-turn head: knows when the speaker has finished a sentence.
-- SIMD on ARM (`i8mm`, `dotprod` or plain NEON, picked at runtime), x86_64 SSE, and WASM; int4 weights stay int4 in memory (~46 MB loaded for a 38 MB model).
+- Built-in Silero VAD and end-of-turn head.
+- SIMD on ARM (`i8mm`, `dotprod` or plain NEON, picked at runtime), x86_64 (the integer kernels of ARM with AVX-512 VNNI, AVX-VNNI or AVX2, picked at runtime; `TINYASR_INT8=0` or no AVX2: f32 with AVX-512, AVX2 or SSE2), and WASM (SIMD128; relaxed SIMD); int4 weights stay int4 in memory (~46 MB loaded for a 38 MB model).
 - Multi-threading supported.
 - Zero dependencies.
 
